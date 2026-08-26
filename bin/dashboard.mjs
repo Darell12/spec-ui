@@ -39,6 +39,148 @@ function readSnippet(path) {
   return text.slice(0, SNIPPET_LIMIT) + `\n\n… truncated, open ${path} to read the rest.`;
 }
 
+function slugify(...parts) {
+  return parts.join("-").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+}
+
+function mdInline(text) {
+  let out = escapeHtml(text);
+  out = out.replace(/`([^`]+)`/g, "<code>$1</code>");
+  out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  out = out.replace(/(?<!\*)\*([^*]+)\*(?!\*)/g, "<em>$1</em>");
+  out = out.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  return out;
+}
+
+// ponytail: covers the markdown SDD docs actually use (headings, lists, task
+// checkboxes, code fences, bold/italic/code/links) — not full CommonMark.
+function mdToHtml(text) {
+  const lines = text.split("\n");
+  let html = "";
+  let inCode = false;
+  let listType = null;
+
+  const closeList = () => {
+    if (listType) html += `</${listType}>\n`;
+    listType = null;
+  };
+  let paragraph = [];
+  const flushParagraph = () => {
+    if (paragraph.length) html += `<p>${mdInline(paragraph.join(" "))}</p>\n`;
+    paragraph = [];
+  };
+
+  let tableBuffer = [];
+  const parseRow = (line) =>
+    line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((c) => c.trim());
+  const flushTable = () => {
+    if (tableBuffer.length < 2) {
+      for (const l of tableBuffer) html += `<p>${mdInline(l.trim())}</p>\n`;
+      tableBuffer = [];
+      return;
+    }
+    const isSeparator = /^[\s|:-]+$/.test(tableBuffer[1]) && tableBuffer[1].includes("-");
+    if (!isSeparator) {
+      for (const l of tableBuffer) html += `<p>${mdInline(l.trim())}</p>\n`;
+      tableBuffer = [];
+      return;
+    }
+    const header = parseRow(tableBuffer[0]);
+    const bodyRows = tableBuffer.slice(2).map(parseRow);
+    html += `<table class="md-table"><thead><tr>${header.map((h) => `<th>${mdInline(h)}</th>`).join("")}</tr></thead><tbody>`;
+    for (const row of bodyRows) {
+      html += `<tr>${row.map((c) => `<td>${mdInline(c)}</td>`).join("")}</tr>`;
+    }
+    html += "</tbody></table>\n";
+    tableBuffer = [];
+  };
+  const isTableRow = (line) => /^\s*\|.*\|\s*$/.test(line);
+
+  for (const line of lines) {
+    if (line.trim().startsWith("```")) {
+      flushParagraph();
+      closeList();
+      if (tableBuffer.length) flushTable();
+      html += inCode ? "</code></pre>\n" : '<pre class="md-code"><code>';
+      inCode = !inCode;
+      continue;
+    }
+    if (inCode) {
+      html += escapeHtml(line) + "\n";
+      continue;
+    }
+
+    if (isTableRow(line)) {
+      tableBuffer.push(line);
+      continue;
+    }
+    if (tableBuffer.length) {
+      flushParagraph();
+      closeList();
+      flushTable();
+    }
+
+    const heading = line.match(/^(#{1,4})\s+(.*)/);
+    if (heading) {
+      flushParagraph();
+      closeList();
+      const level = heading[1].length + 1;
+      html += `<h${level} class="md-h${heading[1].length}">${mdInline(heading[2])}</h${level}>\n`;
+      continue;
+    }
+
+    const checkbox = line.match(/^[ \t]*-\s*\[([ xX])\]\s+(.*)/);
+    if (checkbox) {
+      flushParagraph();
+      if (listType !== "ul") {
+        closeList();
+        html += '<ul class="md-tasks">\n';
+        listType = "ul";
+      }
+      const done = checkbox[1].toLowerCase() === "x";
+      html += `<li class="md-task${done ? " done" : ""}"><input type="checkbox" disabled${done ? " checked" : ""}> <span>${mdInline(checkbox[2])}</span></li>\n`;
+      continue;
+    }
+
+    const bullet = line.match(/^[ \t]*[-*]\s+(.*)/);
+    if (bullet) {
+      flushParagraph();
+      if (listType !== "ul") {
+        closeList();
+        html += "<ul>\n";
+        listType = "ul";
+      }
+      html += `<li>${mdInline(bullet[1])}</li>\n`;
+      continue;
+    }
+
+    const numbered = line.match(/^[ \t]*\d+\.\s+(.*)/);
+    if (numbered) {
+      flushParagraph();
+      if (listType !== "ol") {
+        closeList();
+        html += "<ol>\n";
+        listType = "ol";
+      }
+      html += `<li>${mdInline(numbered[1])}</li>\n`;
+      continue;
+    }
+
+    if (line.trim() === "") {
+      flushParagraph();
+      closeList();
+      continue;
+    }
+
+    paragraph.push(line.trim());
+  }
+  flushParagraph();
+  closeList();
+  if (tableBuffer.length) flushTable();
+  if (inCode) html += "</code></pre>\n";
+  return html;
+}
+
 function specDeltaFiles(changeDir) {
   const specsDir = join(changeDir, "specs");
   if (!existsSync(specsDir)) return [];
@@ -160,23 +302,11 @@ function groupBySource(items) {
   return bySource;
 }
 
-function renderFiles(files) {
-  if (!files.length) return "";
-  return files
-    .map((f) => {
-      const content = readSnippet(f.path);
-      return `<details>
-        <summary>${f.label}</summary>
-        <pre>${escapeHtml(content)}</pre>
-      </details>`;
-    })
-    .join("\n");
-}
-
 function renderCard(item) {
   const status = statusOf(item);
   const pct = item.tasks && item.tasks.total ? Math.round((item.tasks.done / item.tasks.total) * 100) : 0;
   const taskLabel = item.tasks ? `${item.tasks.done}/${item.tasks.total} tasks` : "no tasks.md";
+  const slug = slugify(item.source, item.name);
   return `<div class="card status-${status}">
     <h3 class="card-name">${item.name}</h3>
     <div class="bar"><div class="bar-fill" style="width:${pct}%"></div></div>
@@ -184,7 +314,32 @@ function renderCard(item) {
       <span>${taskLabel}</span>
       <span>${item.updated ? item.updated.toLocaleDateString() : ""}</span>
     </div>
-    <div class="files">${renderFiles(item.files)}</div>
+    <a class="detail-link" href="#detail-${slug}">View details →</a>
+  </div>`;
+}
+
+function renderDetailView(item) {
+  const slug = slugify(item.source, item.name);
+  const steps = item.phases
+    .map((p) => `<span class="detail-step${p.done ? " done" : ""}">${p.label}</span>`)
+    .join("");
+  const sections = item.files
+    .map(
+      (f) => `<section class="detail-section">
+        <h2>${f.label}</h2>
+        ${mdToHtml(readSnippet(f.path))}
+      </section>`
+    )
+    .join("\n");
+
+  return `<div class="detail-view" id="detail-${slug}">
+    <a class="detail-back" href="#">← Back to board</a>
+    <div class="detail-header">
+      <span class="badge-source">${item.source}</span>
+      <h1>${item.name}</h1>
+      <div class="detail-steps">${steps}</div>
+    </div>
+    ${sections || '<p class="empty">No readable files for this change yet.</p>'}
   </div>`;
 }
 
@@ -235,6 +390,7 @@ function renderProjectLink(root, live) {
 function render(root, items, { live = false } = {}) {
   const bySource = groupBySource(items);
   const boards = [...bySource.entries()].map(([source, sourceItems]) => renderBoard(source, sourceItems)).join("\n");
+  const detailViews = items.map(renderDetailView).join("\n");
 
   return `<!doctype html>
 <html lang="en">
@@ -300,12 +456,36 @@ function render(root, items, { live = false } = {}) {
   .bar { background: rgba(136,136,136,0.22); border-radius: 999px; height: 5px; overflow: hidden; margin-bottom: 6px; }
   .bar-fill { background: var(--accent); height: 100%; }
   .status-no-tasks .bar-fill, .status-not-started .bar-fill { background: var(--muted); }
-  .meta { display: flex; align-items: center; justify-content: space-between; font-size: 0.7rem; color: var(--muted); }
-  .files { margin-top: 8px; }
-  .files details { border-top: 1px solid var(--border); padding: 6px 0; }
-  .files summary { cursor: pointer; font-size: 0.74rem; font-weight: 600; }
-  .files pre { white-space: pre-wrap; font-size: 0.72rem; max-height: 260px; overflow-y: auto; background: var(--accent-tint); padding: 8px; border-radius: 6px; }
+  .meta { display: flex; align-items: center; justify-content: space-between; font-size: 0.7rem; color: var(--muted); margin-bottom: 8px; }
+  .detail-link { font-size: 0.72rem; font-weight: 600; color: var(--accent); text-decoration: none; }
+  .detail-link:hover { color: var(--accent-hover); }
   .empty { color: var(--muted); font-style: italic; }
+
+  .detail-view { display: none; position: fixed; inset: 0; background: var(--bg); z-index: 50; overflow-y: auto; padding: 32px 24px 60px; }
+  .detail-view:target { display: block; }
+  .detail-back { display: inline-block; color: var(--muted); text-decoration: none; font-size: 0.82rem; margin-bottom: 18px; }
+  .detail-back:hover { color: var(--accent); }
+  .detail-header { max-width: 760px; margin: 0 auto; }
+  .badge-source { font-size: 0.68rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+  .detail-header h1 { font-size: 1.4rem; margin: 4px 0 14px; }
+  .detail-steps { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
+  .detail-step { font-size: 0.72rem; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
+  .detail-step.done { background: var(--accent-tint); border-color: var(--accent); color: var(--accent); }
+  .detail-section { max-width: 760px; margin: 32px auto 0; }
+  .detail-section h2 { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); border-bottom: 1px solid var(--border); padding-bottom: 8px; margin: 0 0 14px; }
+  .detail-section h3, .detail-section h4, .detail-section h5 { margin: 20px 0 8px; }
+  .detail-section p { line-height: 1.6; margin: 0 0 12px; }
+  .detail-section ul, .detail-section ol { padding-left: 22px; line-height: 1.6; margin: 0 0 12px; }
+  .detail-section .md-tasks { list-style: none; padding-left: 0; }
+  .detail-section .md-task { display: flex; align-items: baseline; gap: 8px; padding: 2px 0; }
+  .detail-section .md-task.done span { color: var(--muted); text-decoration: line-through; }
+  .detail-section code { background: var(--accent-tint); padding: 1px 5px; border-radius: 4px; font-size: 0.85em; }
+  .detail-section pre.md-code { background: var(--accent-tint); padding: 12px; border-radius: 8px; overflow-x: auto; }
+  .detail-section pre.md-code code { background: none; padding: 0; }
+  .detail-section a { color: var(--accent); }
+  .detail-section table.md-table { width: 100%; border-collapse: collapse; margin: 0 0 16px; font-size: 0.85rem; }
+  .detail-section table.md-table th, .detail-section table.md-table td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; vertical-align: top; }
+  .detail-section table.md-table th { background: var(--accent-tint); font-weight: 600; }
 </style>
 </head>
 <body>
@@ -317,6 +497,7 @@ function render(root, items, { live = false } = {}) {
     <div class="page-sub">${renderProjectLink(root, live)}<span>·</span><span>generated ${new Date().toLocaleString()}</span></div>
     ${boards || '<p class="empty">No openspec/changes or specs/*/spec.md found here.</p>'}
   </div>
+  ${detailViews}
   ${live ? LIVE_RELOAD_SCRIPT : ""}
 </body>
 </html>`;
@@ -487,6 +668,18 @@ async function runSelfCheck() {
   assert.ok(html.includes("add-login"));
   assert.ok(html.includes("001-search"));
   assert.ok(html.includes("spec delta"), "readable content should be embedded");
+  assert.ok(html.includes('id="detail-openspec-add-login"'), "detail view should exist per item");
+  assert.ok(html.includes('href="#detail-openspec-add-login"'), "card should link to its detail view");
+
+  const md = mdToHtml("# Title\n\n- [x] done task\n- [ ] pending task\n\nSome **bold** and `code` and <script>alert(1)</script>.\n");
+  assert.ok(md.includes("<h2 class=\"md-h1\">Title</h2>"), "heading should render");
+  assert.ok(md.includes('<li class="md-task done">'), "checked task should get the done class");
+  assert.ok(md.includes('<input type="checkbox" disabled>'), "unchecked task should render an unchecked checkbox");
+  assert.ok(md.includes("<strong>bold</strong>") && md.includes("<code>code</code>"), "inline markdown should render");
+  assert.ok(!md.includes("<script>alert"), "raw HTML in markdown source must be escaped");
+
+  const table = mdToHtml("| Area | Impact |\n|------|--------|\n| a.ts | New |\n");
+  assert.ok(table.includes("<table") && table.includes("<th>Area</th>") && table.includes("<td>New</td>"), "markdown tables should render as tables, not raw pipes");
 
   await testLiveReload(root);
 
