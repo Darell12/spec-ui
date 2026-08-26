@@ -12,12 +12,15 @@ const LIVE_RELOAD_SCRIPT = `<script>new EventSource('/events').onmessage = () =>
 
 const SNIPPET_LIMIT = 6000;
 
-function countTasks(tasksMdPath) {
-  if (!existsSync(tasksMdPath)) return null;
-  const text = readFileSync(tasksMdPath, "utf8");
+function countTasksInText(text) {
   const total = (text.match(/^[ \t]*-\s*\[[ xX]\]/gm) || []).length;
   const done = (text.match(/^[ \t]*-\s*\[[xX]\]/gm) || []).length;
   return { total, done };
+}
+
+function countTasks(tasksMdPath) {
+  if (!existsSync(tasksMdPath)) return null;
+  return countTasksInText(readFileSync(tasksMdPath, "utf8"));
 }
 
 function mtime(path) {
@@ -178,6 +181,38 @@ function mdToHtml(text) {
   closeList();
   if (tableBuffer.length) flushTable();
   if (inCode) html += "</code></pre>\n";
+  return html;
+}
+
+// SDD tasks.md consistently groups work under "## Phase N: Title" headings —
+// render each as its own collapsible with a per-phase task count, instead of
+// one long undifferentiated scroll. Falls back to plain rendering when a
+// tasks.md doesn't use phase headings.
+function renderTasksPanel(content) {
+  const phaseHeading = /^##\s+(Phase\s+\d+.*)$/gm;
+  const matches = [...content.matchAll(phaseHeading)];
+  if (!matches.length) return mdToHtml(content);
+
+  const intro = content.slice(0, matches[0].index).trim();
+  let html = intro ? `<div class="phase-intro">${mdToHtml(intro)}</div>` : "";
+
+  matches.forEach((m, i) => {
+    const title = m[1].trim();
+    const start = m.index + m[0].length;
+    const end = i + 1 < matches.length ? matches[i + 1].index : content.length;
+    const body = content.slice(start, end);
+    const counts = countTasksInText(body);
+    const pct = counts.total ? Math.round((counts.done / counts.total) * 100) : 0;
+    html += `<details class="phase-block" open>
+      <summary>
+        <span class="phase-title">${escapeHtml(title)}</span>
+        <span class="phase-count">${counts.total ? `${counts.done}/${counts.total}` : "—"}</span>
+      </summary>
+      <div class="phase-bar"><div class="phase-bar-fill" style="width:${pct}%"></div></div>
+      <div class="phase-body">${mdToHtml(body)}</div>
+    </details>`;
+  });
+
   return html;
 }
 
@@ -348,7 +383,7 @@ function renderDetailView(item) {
           ${item.files.map((f, i) => `<label class="tab-label" for="tab-${slug}-${i}">${f.label}</label>`).join("\n")}
         </div>
         <div class="tab-panels">
-          ${item.files.map((f) => `<div class="tab-panel">${mdToHtml(readSnippet(f.path))}</div>`).join("\n")}
+          ${item.files.map((f) => `<div class="tab-panel">${f.label === "Tasks" ? renderTasksPanel(readSnippet(f.path)) : mdToHtml(readSnippet(f.path))}</div>`).join("\n")}
         </div>
       </div>`
     : '<p class="empty">No readable files for this change yet.</p>';
@@ -512,6 +547,15 @@ function render(root, items, { live = false } = {}) {
   .tab-panel table.md-table { width: 100%; border-collapse: collapse; margin: 0 0 16px; font-size: 0.85rem; }
   .tab-panel table.md-table th, .tab-panel table.md-table td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; vertical-align: top; }
   .tab-panel table.md-table th { background: var(--accent-tint); font-weight: 600; }
+  .phase-intro { margin-bottom: 24px; }
+  .phase-block { border: 1px solid var(--border); border-radius: 10px; padding: 12px 16px; margin-bottom: 12px; }
+  .phase-block summary { display: flex; align-items: center; justify-content: space-between; gap: 10px; cursor: pointer; font-weight: 600; }
+  .phase-title { font-size: 0.88rem; }
+  .phase-count { font-size: 0.72rem; color: var(--muted); background: var(--accent-tint); padding: 2px 9px; border-radius: 999px; flex-shrink: 0; }
+  .phase-bar { background: rgba(136,136,136,0.22); border-radius: 999px; height: 4px; overflow: hidden; margin: 10px 0 4px; }
+  .phase-bar-fill { background: var(--accent); height: 100%; }
+  .phase-body { margin-top: 10px; }
+  .phase-body > *:first-child { margin-top: 0; }
 </style>
 </head>
 <body>
@@ -706,6 +750,25 @@ async function runSelfCheck() {
 
   const table = mdToHtml("| Area | Impact |\n|------|--------|\n| a.ts | New |\n");
   assert.ok(table.includes("<table") && table.includes("<th>Area</th>") && table.includes("<td>New</td>"), "markdown tables should render as tables, not raw pipes");
+
+  const tasksMd = [
+    "# Tasks: Sample",
+    "## Review Workload Forecast",
+    "Some forecast text.",
+    "## Phase 0: Setup",
+    "- [x] 0.1 done",
+    "- [ ] 0.2 pending",
+    "## Phase 1: Build",
+    "- [x] 1.1 done",
+    "- [x] 1.2 done",
+    "",
+  ].join("\n");
+  const phased = renderTasksPanel(tasksMd);
+  assert.ok(phased.includes('class="phase-intro"'), "content before the first Phase heading should be its own intro block");
+  assert.ok(phased.includes("Phase 0: Setup") && phased.includes("Phase 1: Build"), "each Phase heading should get its own section");
+  assert.ok(phased.match(/<span class="phase-count">1\/2<\/span>/), "phase 0 should count 1 of 2 tasks done");
+  assert.ok(phased.match(/<span class="phase-count">2\/2<\/span>/), "phase 1 should count 2 of 2 tasks done");
+  assert.strictEqual(renderTasksPanel("- [x] no phases here\n"), mdToHtml("- [x] no phases here\n"), "no Phase headings should fall back to plain rendering");
 
   await testLiveReload(root);
 
