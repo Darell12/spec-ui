@@ -1,11 +1,14 @@
 #!/usr/bin/env node
 // Minimal, dependency-free dashboard for OpenSpec + SpecKit progress.
-// Usage: node bin/dashboard.mjs [projectRoot] [--test] [--no-open]
+// Usage: node bin/dashboard.mjs [projectRoot] [--test] [--no-open] [--live]
 
-import { readdirSync, readFileSync, statSync, existsSync, writeFileSync } from "node:fs";
+import { readdirSync, readFileSync, statSync, existsSync, writeFileSync, watch } from "node:fs";
 import { join, basename } from "node:path";
 import { execSync } from "node:child_process";
+import { createServer } from "node:http";
 import assert from "node:assert";
+
+const LIVE_RELOAD_SCRIPT = `<script>new EventSource('/events').onmessage = () => location.reload();</script>`;
 
 const SNIPPET_LIMIT = 6000;
 
@@ -163,7 +166,7 @@ function renderFiles(files) {
     .join("\n");
 }
 
-function render(root, items) {
+function render(root, items, { live = false } = {}) {
   const rows = items
     .sort((a, b) => (b.updated || 0) - (a.updated || 0))
     .map((item) => {
@@ -227,8 +230,70 @@ function render(root, items) {
   <div class="grid">
     ${rows || '<p class="empty">No openspec/changes or specs/*/spec.md found here.</p>'}
   </div>
+  ${live ? LIVE_RELOAD_SCRIPT : ""}
 </body>
 </html>`;
+}
+
+function openInBrowser(target) {
+  const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
+  try {
+    execSync(`${opener} "${target}"`);
+  } catch {
+    console.log(`Could not auto-open browser, open ${target} manually.`);
+  }
+}
+
+// ponytail: recursive fs.watch works on macOS/Windows out of the box; Linux needs
+// { recursive: true } support (Node 20+) or falls back to non-recursive watch — good
+// enough for a single-project PoC, revisit if this ships cross-platform.
+function startLiveServer(root, { port = 4949, open = true } = {}) {
+  const clients = new Set();
+  let debounceTimer = null;
+
+  function broadcastRefresh() {
+    for (const res of clients) res.write("data: refresh\n\n");
+  }
+
+  function scheduleRefresh() {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(broadcastRefresh, 150);
+  }
+
+  const watchDirs = [join(root, "openspec"), join(root, "specs")].filter(existsSync);
+  const watchers = watchDirs.map((dir) => watch(dir, { recursive: true }, scheduleRefresh));
+
+  const server = createServer((req, res) => {
+    if (req.url === "/events") {
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+      });
+      res.write("\n");
+      clients.add(res);
+      const heartbeat = setInterval(() => res.write(":hb\n\n"), 20000);
+      req.on("close", () => {
+        clearInterval(heartbeat);
+        clients.delete(res);
+      });
+      return;
+    }
+    const items = [...scanOpenSpec(root), ...scanSpecKit(root)];
+    res.writeHead(200, { "Content-Type": "text/html" });
+    res.end(render(root, items, { live: true }));
+  });
+
+  server.on("close", () => watchers.forEach((w) => w.close()));
+  server.listen(port, () => {
+    if (open) {
+      const { port: actualPort } = server.address();
+      console.log(`Live dashboard: http://localhost:${actualPort}`);
+      openInBrowser(`http://localhost:${actualPort}`);
+    }
+  });
+
+  return server;
 }
 
 async function runSelfCheck() {
@@ -285,7 +350,43 @@ async function runSelfCheck() {
   assert.ok(html.includes("001-search"));
   assert.ok(html.includes("spec delta"), "readable content should be embedded");
 
+  await testLiveReload(root);
+
   console.log("self-check passed");
+}
+
+async function testLiveReload(root) {
+  const server = startLiveServer(root, { port: 0, open: false });
+  await new Promise((resolve) => server.once("listening", resolve));
+  const port = server.address().port;
+
+  const pageRes = await fetch(`http://localhost:${port}/`);
+  assert.strictEqual(pageRes.status, 200);
+  assert.ok((await pageRes.text()).includes("EventSource"), "live page should include the reload script");
+
+  const controller = new AbortController();
+  const sseRes = await fetch(`http://localhost:${port}/events`, { signal: controller.signal });
+  const abortTimer = setTimeout(() => controller.abort(), 3000);
+
+  setTimeout(() => {
+    writeFileSync(join(root, "openspec", "changes", "add-login", "tasks.md"), "- [x] 1.1 done\n- [x] 1.2 done\n");
+  }, 100);
+
+  const decoder = new TextDecoder();
+  let received = "";
+  try {
+    for await (const chunk of sseRes.body) {
+      received += decoder.decode(chunk);
+      if (received.includes("refresh")) break;
+    }
+  } catch (err) {
+    if (err.name !== "AbortError") throw err;
+  } finally {
+    clearTimeout(abortTimer);
+  }
+
+  server.close();
+  assert.ok(received.includes("refresh"), "expected an SSE refresh event after a watched file changed");
 }
 
 async function main() {
@@ -296,20 +397,19 @@ async function main() {
   }
 
   const root = args.find((a) => !a.startsWith("--")) || process.cwd();
+
+  if (args.includes("--live")) {
+    startLiveServer(root, { open: !args.includes("--no-open") });
+    return; // server.listen keeps the process alive
+  }
+
   const items = [...scanOpenSpec(root), ...scanSpecKit(root)];
   const html = render(root, items);
   const outPath = join(root, "specs-dashboard.html");
   writeFileSync(outPath, html);
   console.log(`Wrote ${outPath} (${items.length} spec/change(s) found)`);
 
-  if (!args.includes("--no-open")) {
-    const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
-    try {
-      execSync(`${opener} "${outPath}"`);
-    } catch {
-      console.log("Could not auto-open browser, open the file manually.");
-    }
-  }
+  if (!args.includes("--no-open")) openInBrowser(outPath);
 }
 
 main();
