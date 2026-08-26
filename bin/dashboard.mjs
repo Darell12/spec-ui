@@ -2,10 +2,11 @@
 // Minimal, dependency-free dashboard for OpenSpec + SpecKit progress.
 // Usage: node bin/dashboard.mjs [projectRoot] [--test] [--no-open] [--live]
 
-import { readdirSync, readFileSync, statSync, existsSync, writeFileSync, watch } from "node:fs";
-import { join, basename, resolve } from "node:path";
+import { readdirSync, readFileSync, statSync, existsSync, writeFileSync, mkdirSync, watch } from "node:fs";
+import { join, basename, resolve, dirname } from "node:path";
 import { execSync, spawn } from "node:child_process";
 import { createServer } from "node:http";
+import { homedir } from "node:os";
 import assert from "node:assert";
 
 const LIVE_RELOAD_SCRIPT = `<script>new EventSource('/events').onmessage = () => location.reload();</script>`;
@@ -80,6 +81,27 @@ const SEARCH_SCRIPT = `<script>
     });
   }
   input.addEventListener("input", applyFilter);
+})();
+</script>`;
+
+const PROJECT_SWITCH_SCRIPT = `<script>
+(function () {
+  function switchProject(path) {
+    if (!path) return;
+    fetch("/switch-project?path=" + encodeURIComponent(path)).then(function (r) {
+      if (r.ok) { location.reload(); return; }
+      r.text().then(function (msg) { alert(msg || "Could not switch project"); });
+    });
+  }
+  document.querySelectorAll(".project-item").forEach(function (btn) {
+    btn.addEventListener("click", function () { switchProject(btn.dataset.path); });
+  });
+  document.querySelectorAll(".project-go").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var input = btn.previousElementSibling;
+      switchProject(input ? input.value.trim() : "");
+    });
+  });
 })();
 </script>`;
 
@@ -661,6 +683,28 @@ function renderProjectLink(root, live) {
     </button>`;
 }
 
+function renderProjectSwitcher(root, live) {
+  if (!live) return "";
+  const recents = loadRecentProjects().filter((p) => p !== root);
+  const items = recents
+    .map(
+      (p) =>
+        `<button type="button" class="project-item" data-path="${escapeHtml(p)}" title="${escapeHtml(p)}">${escapeHtml(basename(p))}</button>`
+    )
+    .join("\n");
+
+  return `<div class="columns-toggle project-switch">
+    <button type="button" class="cols-btn" onclick="this.nextElementSibling.classList.toggle('open')">Projects ▾</button>
+    <div class="cols-menu">
+      ${items || '<div class="project-empty">No other recent projects</div>'}
+      <div class="project-add">
+        <input type="text" class="project-input" placeholder="Paste a project path…">
+        <button type="button" class="project-go">Open</button>
+      </div>
+    </div>
+  </div>`;
+}
+
 function render(root, items, { live = false } = {}) {
   const bySource = groupBySource(items);
   const boards = [...bySource.entries()].map(([source, sourceItems]) => renderBoard(source, sourceItems)).join("\n");
@@ -725,6 +769,13 @@ function render(root, items, { live = false } = {}) {
   .cols-menu { display: none; position: absolute; right: 0; top: calc(100% + 6px); background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; z-index: 10; box-shadow: 0 6px 18px rgba(0,0,0,0.25); min-width: 150px; }
   .cols-menu.open { display: block; }
   .cols-menu label { display: flex; align-items: center; gap: 6px; font-size: 0.78rem; padding: 3px 0; cursor: pointer; white-space: nowrap; }
+  .project-item { display: block; width: 100%; text-align: left; background: none; border: none; color: var(--text); font-family: inherit; font-size: 0.78rem; padding: 5px 4px; cursor: pointer; border-radius: 4px; white-space: nowrap; }
+  .project-item:hover { background: var(--accent-tint); color: var(--accent); }
+  .project-empty { font-size: 0.76rem; color: var(--muted); font-style: italic; padding: 4px; white-space: nowrap; }
+  .project-add { display: flex; gap: 6px; margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--border); }
+  .project-input { flex: 1; min-width: 160px; font-family: inherit; font-size: 0.76rem; padding: 4px 7px; border-radius: 5px; border: 1px solid var(--border); background: var(--bg); color: var(--text); }
+  .project-go { font-size: 0.76rem; padding: 4px 9px; border-radius: 5px; border: 1px solid var(--border); background: var(--surface); color: var(--accent); cursor: pointer; }
+  .project-go:hover { border-color: var(--accent); background: var(--accent-tint); }
   .board-section + .board-section { margin-top: 32px; }
   .board { display: flex; gap: 16px; overflow-x: auto; padding-bottom: 8px; }
   .column { flex: 1 1 220px; min-width: 220px; display: flex; flex-direction: column; gap: 12px; }
@@ -801,12 +852,13 @@ function render(root, items, { live = false } = {}) {
       <input type="search" id="card-search" class="card-search" placeholder="Filter by name…" autocomplete="off">
       ${live ? '<span class="live-badge"><span class="live-dot"></span>Live</span>' : ""}
     </div>
-    <div class="page-sub">${renderProjectLink(root, live)}<span>·</span><span>generated ${new Date().toLocaleString()}</span></div>
+    <div class="page-sub">${renderProjectLink(root, live)}<span>·</span><span>generated ${new Date().toLocaleString()}</span>${renderProjectSwitcher(root, live)}</div>
     ${boards || '<p class="empty">No openspec/changes or specs/*/spec.md found here.</p>'}
   </div>
   ${detailViews}
   ${COLUMNS_TOGGLE_SCRIPT}
   ${SEARCH_SCRIPT}
+  ${live ? PROJECT_SWITCH_SCRIPT : ""}
   ${live ? LIVE_RELOAD_SCRIPT : ""}
 </body>
 </html>`;
@@ -839,6 +891,29 @@ function spawnDetached(cmd, args, opts = {}) {
       resolve(true);
     });
   });
+}
+
+let RECENT_PROJECTS_FILE = join(homedir(), ".spec-ui", "recent-projects.json");
+const MAX_RECENT_PROJECTS = 8;
+
+function loadRecentProjects() {
+  try {
+    const data = JSON.parse(readFileSync(RECENT_PROJECTS_FILE, "utf8"));
+    return Array.isArray(data.projects) ? data.projects : [];
+  } catch {
+    return [];
+  }
+}
+
+function addRecentProject(root) {
+  const list = loadRecentProjects().filter((p) => p !== root);
+  list.unshift(root);
+  try {
+    mkdirSync(dirname(RECENT_PROJECTS_FILE), { recursive: true });
+    writeFileSync(RECENT_PROJECTS_FILE, JSON.stringify({ projects: list.slice(0, MAX_RECENT_PROJECTS) }, null, 2));
+  } catch {
+    // Non-fatal — recent-projects is a convenience, not required for the tool to work.
+  }
 }
 
 function openFolder(root) {
@@ -892,7 +967,9 @@ function scanPhaseSnapshot(root) {
 function startLiveServer(root, { port = 4949, open = true, notifyOnChange = true } = {}) {
   const clients = new Set();
   let debounceTimer = null;
-  let lastSnapshot = notifyOnChange ? scanPhaseSnapshot(root).snapshot : null;
+  let currentRoot = root;
+  let lastSnapshot = notifyOnChange ? scanPhaseSnapshot(currentRoot).snapshot : null;
+  let watchers = [];
 
   function broadcastRefresh() {
     for (const res of clients) res.write("data: refresh\n\n");
@@ -902,7 +979,7 @@ function startLiveServer(root, { port = 4949, open = true, notifyOnChange = true
     clearTimeout(debounceTimer);
     debounceTimer = setTimeout(() => {
       if (notifyOnChange) {
-        const { items, snapshot } = scanPhaseSnapshot(root);
+        const { items, snapshot } = scanPhaseSnapshot(currentRoot);
         for (const item of items) {
           const key = `${item.source}:${item.name}`;
           const prevIdx = lastSnapshot.get(key);
@@ -917,11 +994,24 @@ function startLiveServer(root, { port = 4949, open = true, notifyOnChange = true
     }, 150);
   }
 
-  const watchDirs = [join(root, "openspec"), join(root, "specs")].filter(existsSync);
-  const watchers = watchDirs.map((dir) => watch(dir, { recursive: true }, scheduleRefresh));
+  function attachWatchers(dirRoot) {
+    watchers.forEach((w) => w.close());
+    const watchDirs = [join(dirRoot, "openspec"), join(dirRoot, "specs")].filter(existsSync);
+    watchers = watchDirs.map((dir) => watch(dir, { recursive: true }, scheduleRefresh));
+  }
+
+  function switchTo(newRoot) {
+    currentRoot = newRoot;
+    lastSnapshot = notifyOnChange ? scanPhaseSnapshot(currentRoot).snapshot : null;
+    attachWatchers(currentRoot);
+    addRecentProject(currentRoot);
+  }
+
+  attachWatchers(currentRoot);
 
   const server = createServer(async (req, res) => {
-    if (req.url === "/events") {
+    const url = new URL(req.url, "http://localhost");
+    if (url.pathname === "/events") {
       res.writeHead(200, {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
@@ -936,15 +1026,27 @@ function startLiveServer(root, { port = 4949, open = true, notifyOnChange = true
       });
       return;
     }
-    if (req.url === "/open-folder" || req.url === "/open-terminal") {
-      const ok = await (req.url === "/open-folder" ? openFolder(root) : openTerminal(root));
+    if (url.pathname === "/open-folder" || url.pathname === "/open-terminal") {
+      const ok = await (url.pathname === "/open-folder" ? openFolder(currentRoot) : openTerminal(currentRoot));
       res.writeHead(ok ? 200 : 500, { "Content-Type": "text/plain" });
       res.end(ok ? "ok" : "failed");
       return;
     }
-    const items = [...scanOpenSpec(root), ...scanSpecKit(root)];
+    if (url.pathname === "/switch-project") {
+      const target = resolve(url.searchParams.get("path") || "");
+      if (!target || !existsSync(target) || !statSync(target).isDirectory()) {
+        res.writeHead(400, { "Content-Type": "text/plain" });
+        res.end("Path does not exist or is not a directory: " + target);
+        return;
+      }
+      switchTo(target);
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.end("ok");
+      return;
+    }
+    const items = [...scanOpenSpec(currentRoot), ...scanSpecKit(currentRoot)];
     res.writeHead(200, { "Content-Type": "text/html" });
-    res.end(render(root, items, { live: true }));
+    res.end(render(currentRoot, items, { live: true }));
   });
 
   server.on("close", () => watchers.forEach((w) => w.close()));
@@ -976,6 +1078,9 @@ async function runSelfCheck() {
   const os = await import("node:os");
   const fs = await import("node:fs");
   const root = fs.mkdtempSync(join(os.tmpdir(), "spec-ui-test-"));
+
+  // Never touch the real ~/.spec-ui/recent-projects.json during --test.
+  RECENT_PROJECTS_FILE = join(root, ".recent-projects-test.json");
 
   const changeDir = join(root, "openspec", "changes", "add-login");
   fs.mkdirSync(join(changeDir, "specs", "auth"), { recursive: true });
@@ -1100,7 +1205,17 @@ async function runSelfCheck() {
   assert.strictEqual(afterPhase, 4, "adding design.md should advance add-login to Verify");
   assert.notStrictEqual(beforePhase, afterPhase, "scanPhaseSnapshot should detect the phase change the --live notifier relies on");
 
+  // Recent-projects list: dedup + move-to-front + cap, against the redirected
+  // RECENT_PROJECTS_FILE so this never touches the real ~/.spec-ui.
+  addRecentProject("/tmp/proj-a");
+  addRecentProject("/tmp/proj-b");
+  addRecentProject("/tmp/proj-a");
+  assert.deepStrictEqual(loadRecentProjects(), ["/tmp/proj-a", "/tmp/proj-b"], "re-adding a project should move it to the front, not duplicate it");
+  for (let i = 0; i < MAX_RECENT_PROJECTS + 3; i++) addRecentProject(`/tmp/proj-extra-${i}`);
+  assert.strictEqual(loadRecentProjects().length, MAX_RECENT_PROJECTS, "recent-projects list should cap at MAX_RECENT_PROJECTS");
+
   await testLiveReload(root);
+  await testProjectSwitch(root);
 
   console.log("self-check passed");
 }
@@ -1139,6 +1254,35 @@ async function testLiveReload(root) {
   assert.ok(received.includes("refresh"), "expected an SSE refresh event after a watched file changed");
 }
 
+async function testProjectSwitch(rootA) {
+  const os = await import("node:os");
+  const fs = await import("node:fs");
+  const rootB = fs.mkdtempSync(join(os.tmpdir(), "spec-ui-test-b-"));
+  fs.mkdirSync(join(rootB, "openspec", "changes", "second-project-change"), { recursive: true });
+  fs.writeFileSync(join(rootB, "openspec", "changes", "second-project-change", "proposal.md"), "# proposal");
+
+  const server = startLiveServer(rootA, { port: 0, open: false, notifyOnChange: false });
+  await new Promise((resolve) => server.once("listening", resolve));
+  const port = server.address().port;
+
+  const before = await (await fetch(`http://localhost:${port}/`)).text();
+  assert.ok(before.includes("add-login"), "should initially show rootA's changes");
+
+  const bad = await fetch(`http://localhost:${port}/switch-project?path=` + encodeURIComponent(join(os.tmpdir(), "does-not-exist-xyz")));
+  assert.strictEqual(bad.status, 400, "switching to a nonexistent path should be rejected");
+
+  const ok = await fetch(`http://localhost:${port}/switch-project?path=` + encodeURIComponent(rootB));
+  assert.strictEqual(ok.status, 200, "switching to a valid project directory should succeed");
+
+  const after = await (await fetch(`http://localhost:${port}/`)).text();
+  assert.ok(after.includes("second-project-change"), "after switching, the page should show rootB's changes");
+  assert.ok(!after.includes("add-login"), "after switching, rootA's changes should no longer appear");
+
+  assert.ok(loadRecentProjects().includes(rootB), "switching to a project should add it to the recent-projects list");
+
+  server.close();
+}
+
 async function main() {
   const args = process.argv.slice(2);
   if (args.includes("--test")) {
@@ -1147,6 +1291,7 @@ async function main() {
   }
 
   const root = resolve(args.find((a) => !a.startsWith("--")) || process.cwd());
+  addRecentProject(root);
 
   if (args.includes("--live")) {
     startLiveServer(root, { open: !args.includes("--no-open"), notifyOnChange: !args.includes("--no-notify") });
