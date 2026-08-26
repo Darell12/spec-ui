@@ -121,6 +121,54 @@ function getCliArtifactStatus(root, changeName) {
   }
 }
 
+let ghAvailable = null;
+function hasGhCli() {
+  if (ghAvailable === null) {
+    try {
+      execSync("gh --version", { stdio: "ignore", timeout: 3000 });
+      ghAvailable = true;
+    } catch {
+      ghAvailable = false;
+    }
+  }
+  return ghAvailable;
+}
+
+// Network call (GitHub, via gh) — unlike the local openspec CLI checks, this
+// is worth a short TTL cache so a live-reload burst doesn't refetch per file.
+const PR_CACHE_TTL = 30000;
+let prCache = { data: null, at: 0 };
+function getAllPrs(root) {
+  if (!hasGhCli()) return [];
+  const now = Date.now();
+  if (prCache.data && now - prCache.at < PR_CACHE_TTL) return prCache.data;
+  try {
+    const out = execSync("gh pr list --state all --json number,state,url,title,headRefName,isDraft --limit 100", {
+      cwd: root,
+      timeout: 8000,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    prCache = { data: JSON.parse(out.toString("utf8")), at: now };
+  } catch {
+    prCache = { data: [], at: now };
+  }
+  return prCache.data;
+}
+
+// Heuristic match: no stored change<->PR mapping exists, so match by branch
+// name first (most reliable if branches are named after the change), then
+// fall back to the PR title containing the change name.
+function findPrForChange(root, changeName) {
+  const prs = getAllPrs(root);
+  if (!prs.length) return null;
+  const needle = changeName.toLowerCase();
+  return (
+    prs.find((p) => (p.headRefName || "").toLowerCase().includes(needle)) ||
+    prs.find((p) => (p.title || "").toLowerCase().includes(needle)) ||
+    null
+  );
+}
+
 function countTasksInText(text) {
   const total = (text.match(/^[ \t]*-\s*\[[ xX]\]/gm) || []).length;
   const done = (text.match(/^[ \t]*-\s*\[[xX]\]/gm) || []).length;
@@ -391,6 +439,7 @@ function scanOpenSpec(root) {
             { label: "Verify report", path: files.verify },
           ].filter((f) => f.path),
           updated: mtime(changeDir),
+          pr: findPrForChange(root, d.name),
         };
       });
 
@@ -430,6 +479,7 @@ function scanSpecKit(root) {
           { label: "Tasks", path: files.tasks },
         ].filter((f) => f.path),
         updated: mtime(featureDir),
+        pr: findPrForChange(root, d.name),
       };
     });
 }
@@ -917,6 +967,12 @@ function startLiveServer(root, { port = 4949, open = true, notifyOnChange = true
 }
 
 async function runSelfCheck() {
+  // Force the file-based fallback paths regardless of what happens to be
+  // installed on the machine running the test — the self-check should be
+  // deterministic, not dependent on whether openspec/gh are on this PATH.
+  cliAvailable = false;
+  ghAvailable = false;
+
   const os = await import("node:os");
   const fs = await import("node:fs");
   const root = fs.mkdtempSync(join(os.tmpdir(), "spec-ui-test-"));
@@ -1001,10 +1057,7 @@ async function runSelfCheck() {
   assert.ok(phased.match(/<span class="phase-count">2\/2<\/span>/), "phase 1 should count 2 of 2 tasks done");
   assert.strictEqual(renderTasksPanel("- [x] no phases here\n"), mdToHtml("- [x] no phases here\n"), "no Phase headings should fall back to plain rendering");
 
-  // This environment has no openspec CLI on PATH, so the dashboard must fall
-  // back to file-based phase detection rather than hang or throw.
-  assert.ok(!hasOpenSpecCli(), "test assumes no real openspec CLI on PATH");
-  assert.ok(html.includes("openspec CLI not found"), "should show the file-based fallback badge when the CLI is absent");
+  assert.ok(html.includes("openspec CLI not found"), "should show the file-based fallback badge when the CLI is forced absent");
 
   const colCheckboxCount = (html.match(/<input type="checkbox" checked data-source="OpenSpec"/g) || []).length;
   assert.strictEqual(colCheckboxCount, active.phases.length, "columns menu should list one checkbox per phase");
@@ -1022,6 +1075,21 @@ async function runSelfCheck() {
   assert.ok(!freshCard.includes("pr-badge"), "no PR badge should render when the item has none");
 
   assert.ok(html.includes('id="card-search"'), "the card-name search input should be embedded");
+
+  // findPrForChange matching heuristic, seeded via the cache directly so no
+  // real `gh` network call happens during --test.
+  ghAvailable = true;
+  prCache = {
+    data: [
+      { number: 10, state: "OPEN", url: "https://x/10", title: "Something else", headRefName: "add-login" },
+      { number: 11, state: "MERGED", url: "https://x/11", title: "feat: old-change work", headRefName: "unrelated-branch" },
+    ],
+    at: Date.now(),
+  };
+  assert.strictEqual(findPrForChange(root, "add-login").number, 10, "should match by branch name first");
+  assert.strictEqual(findPrForChange(root, "old-change").number, 11, "should fall back to matching by PR title");
+  assert.strictEqual(findPrForChange(root, "no-such-change"), null, "no match should return null");
+  ghAvailable = false;
 
   // Underlying diff logic for the --live phase-change notification, without
   // actually shelling out to notify() (no real OS popups during --test).
