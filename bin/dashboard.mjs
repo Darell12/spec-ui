@@ -52,6 +52,37 @@ const COLUMNS_TOGGLE_SCRIPT = `<script>
 })();
 </script>`;
 
+const SEARCH_SCRIPT = `<script>
+(function () {
+  var input = document.getElementById("card-search");
+  if (!input) return;
+  function applyFilter() {
+    var q = input.value.trim().toLowerCase();
+    document.querySelectorAll(".column").forEach(function (col) {
+      var visible = 0;
+      col.querySelectorAll(".card").forEach(function (card) {
+        var match = !q || card.dataset.name.indexOf(q) !== -1;
+        card.style.display = match ? "" : "none";
+        if (match) visible++;
+      });
+      var placeholder = col.querySelector(".col-no-match");
+      var hasOriginalCards = col.querySelectorAll(".card").length > 0;
+      if (q && hasOriginalCards && visible === 0) {
+        if (!placeholder) {
+          placeholder = document.createElement("div");
+          placeholder.className = "col-empty col-no-match";
+          placeholder.textContent = "No matches";
+          col.querySelector(".col-body").appendChild(placeholder);
+        }
+      } else if (placeholder) {
+        placeholder.remove();
+      }
+    });
+  }
+  input.addEventListener("input", applyFilter);
+})();
+</script>`;
+
 const SNIPPET_LIMIT = 6000;
 
 // The openspec CLI's built-in "spec-driven" schema only knows these four
@@ -433,18 +464,33 @@ function groupBySource(items) {
   return bySource;
 }
 
+const STALE_DAYS = 14;
+
 function renderCard(item) {
   const status = statusOf(item);
   const pct = item.tasks && item.tasks.total ? Math.round((item.tasks.done / item.tasks.total) * 100) : 0;
   const taskLabel = item.tasks ? `${item.tasks.done}/${item.tasks.total} tasks` : "no tasks.md";
   const slug = slugify(item.source, item.name);
-  return `<div class="card status-${status}">
-    <h3 class="card-name">${item.name}</h3>
+
+  const ageDays = item.updated ? Math.floor((Date.now() - item.updated.getTime()) / 86400000) : null;
+  const isStale = ageDays !== null && ageDays >= STALE_DAYS;
+  const staleBadge = isStale ? `<span class="stale-badge" title="No changes in ${ageDays} days">stale · ${ageDays}d</span>` : "";
+
+  const prBadge = item.pr
+    ? `<a class="pr-badge pr-${item.pr.state.toLowerCase()}" href="${item.pr.url}" target="_blank" rel="noopener">PR #${item.pr.number} · ${item.pr.state.toLowerCase()}${item.pr.isDraft ? " (draft)" : ""}</a>`
+    : "";
+
+  return `<div class="card status-${status}" data-name="${escapeHtml(item.name.toLowerCase())}">
+    <div class="card-top">
+      <h3 class="card-name">${item.name}</h3>
+      ${staleBadge}
+    </div>
     <div class="bar"><div class="bar-fill" style="width:${pct}%"></div></div>
     <div class="meta">
       <span>${taskLabel}</span>
       <span>${item.updated ? item.updated.toLocaleDateString() : ""}</span>
     </div>
+    ${prBadge}
     <a class="detail-link" href="#detail-${slug}">View details →</a>
   </div>`;
 }
@@ -605,9 +651,12 @@ function render(root, items, { live = false } = {}) {
   * { box-sizing: border-box; }
   body { margin: 0; font-family: "SF Mono", "Cascadia Code", "Cascadia Mono", Consolas, "JetBrains Mono", "Liberation Mono", Menlo, Monaco, "Courier New", monospace; line-height: 1.5; background: var(--bg); color: var(--text); }
   .page { padding: 28px 32px 40px; }
-  .page-header { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 4px; }
+  .page-header { display: flex; align-items: center; gap: 16px; margin-bottom: 4px; }
   .page-header h1 { font-size: 1.35rem; margin: 0; }
-  .live-badge { display: inline-flex; align-items: center; gap: 6px; font-size: 0.78rem; color: var(--accent); font-weight: 600; }
+  .card-search { font-family: inherit; font-size: 0.8rem; padding: 5px 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface); color: var(--text); width: 200px; }
+  .card-search:focus { outline: none; border-color: var(--accent); }
+  .card-search::placeholder { color: var(--muted); }
+  .live-badge { display: inline-flex; align-items: center; gap: 6px; font-size: 0.78rem; color: var(--accent); font-weight: 600; margin-left: auto; }
   .live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); animation: pulse 1.8s ease-in-out infinite; }
   @keyframes pulse { 0%, 100% { box-shadow: 0 0 0 0 var(--accent-glow); } 50% { box-shadow: 0 0 0 5px transparent; } }
   .page-sub { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 0.82rem; margin: 0 0 22px; }
@@ -639,12 +688,17 @@ function render(root, items, { live = false } = {}) {
   .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; transition: transform 160ms ease, box-shadow 160ms ease; animation: card-enter 260ms ease; }
   .card:hover { transform: translateY(-2px); box-shadow: 0 6px 18px rgba(0,0,0,0.10); }
   @keyframes card-enter { from { opacity: 0; transform: translateY(-6px) scale(0.97); } to { opacity: 1; transform: none; } }
-  .card-name { font-size: 0.86rem; font-weight: 600; margin: 0 0 8px; line-height: 1.3; }
+  .card-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+  .card-name { font-size: 0.86rem; font-weight: 600; margin: 0; line-height: 1.3; }
+  .stale-badge { flex-shrink: 0; font-size: 0.62rem; padding: 2px 7px; border-radius: 999px; border: 1px dashed var(--border); color: var(--muted); white-space: nowrap; }
   .bar { background: rgba(136,136,136,0.22); border-radius: 999px; height: 5px; overflow: hidden; margin-bottom: 6px; }
   .bar-fill { background: var(--accent); height: 100%; }
   .status-no-tasks .bar-fill, .status-not-started .bar-fill { background: var(--muted); }
   .meta { display: flex; align-items: center; justify-content: space-between; font-size: 0.7rem; color: var(--muted); margin-bottom: 8px; }
-  .detail-link { font-size: 0.72rem; font-weight: 600; color: var(--accent); text-decoration: none; }
+  .pr-badge { display: inline-block; font-size: 0.68rem; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); text-decoration: none; margin-bottom: 8px; }
+  .pr-badge:hover { border-color: var(--accent); color: var(--accent); }
+  .pr-badge.pr-merged { border-color: var(--accent); background: var(--accent-tint); color: var(--accent); }
+  .detail-link { display: block; font-size: 0.72rem; font-weight: 600; color: var(--accent); text-decoration: none; }
   .detail-link:hover { color: var(--accent-hover); }
   .empty { color: var(--muted); font-style: italic; }
 
@@ -694,6 +748,7 @@ function render(root, items, { live = false } = {}) {
   <div class="page">
     <div class="page-header">
       <h1>Specs Dashboard</h1>
+      <input type="search" id="card-search" class="card-search" placeholder="Filter by name…" autocomplete="off">
       ${live ? '<span class="live-badge"><span class="live-dot"></span>Live</span>' : ""}
     </div>
     <div class="page-sub">${renderProjectLink(root, live)}<span>·</span><span>generated ${new Date().toLocaleString()}</span></div>
@@ -701,6 +756,7 @@ function render(root, items, { live = false } = {}) {
   </div>
   ${detailViews}
   ${COLUMNS_TOGGLE_SCRIPT}
+  ${SEARCH_SCRIPT}
   ${live ? LIVE_RELOAD_SCRIPT : ""}
 </body>
 </html>`;
@@ -912,6 +968,18 @@ async function runSelfCheck() {
   assert.strictEqual(colCheckboxCount, active.phases.length, "columns menu should list one checkbox per phase");
   assert.ok(html.includes('class="column" data-source="OpenSpec" data-phase="Proposal"'), "each column should be taggable by source+phase for the hide/show script");
   assert.ok(html.includes("spec-ui:hidden-phases:"), "columns-toggle script with its localStorage key should be embedded");
+
+  const baseItem = { name: "some-change", tasks: { total: 2, done: 1 }, phases: [], files: [], source: "OpenSpec" };
+  const staleCard = renderCard({ ...baseItem, updated: new Date(Date.now() - (STALE_DAYS + 5) * 86400000) });
+  const freshCard = renderCard({ ...baseItem, updated: new Date() });
+  assert.ok(staleCard.includes("stale-badge"), "a change untouched past the threshold should show the stale badge");
+  assert.ok(!freshCard.includes("stale-badge"), "a recently touched change should not show the stale badge");
+
+  const prCard = renderCard({ ...baseItem, updated: new Date(), pr: { number: 5, state: "OPEN", url: "https://example.com/pr/5", isDraft: false } });
+  assert.ok(prCard.includes("PR #5") && prCard.includes('href="https://example.com/pr/5"'), "a matched PR should render as a linked badge");
+  assert.ok(!freshCard.includes("pr-badge"), "no PR badge should render when the item has none");
+
+  assert.ok(html.includes('id="card-search"'), "the card-name search input should be embedded");
 
   await testLiveReload(root);
 
