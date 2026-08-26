@@ -10,6 +10,48 @@ import assert from "node:assert";
 
 const LIVE_RELOAD_SCRIPT = `<script>new EventSource('/events').onmessage = () => location.reload();</script>`;
 
+// Per-viewer column visibility, persisted in localStorage (falls back to
+// in-memory only if storage is unavailable — private mode, some file:// setups).
+const COLUMNS_TOGGLE_SCRIPT = `<script>
+(function () {
+  function storeKey(source) { return "spec-ui:hidden-phases:" + source; }
+  function getHidden(source) {
+    try { return JSON.parse(localStorage.getItem(storeKey(source)) || "[]"); } catch (e) { return []; }
+  }
+  function setHidden(source, list) {
+    try { localStorage.setItem(storeKey(source), JSON.stringify(list)); } catch (e) {}
+  }
+  function applyVisibility(source) {
+    var hidden = getHidden(source);
+    document.querySelectorAll('.column[data-source="' + source + '"]').forEach(function (col) {
+      col.style.display = hidden.indexOf(col.dataset.phase) !== -1 ? "none" : "";
+    });
+    document.querySelectorAll('.cols-menu input[data-source="' + source + '"]').forEach(function (cb) {
+      cb.checked = hidden.indexOf(cb.dataset.phase) === -1;
+    });
+  }
+  document.querySelectorAll(".cols-menu input[type=checkbox]").forEach(function (cb) {
+    cb.addEventListener("change", function () {
+      var source = cb.dataset.source;
+      var hidden = getHidden(source);
+      var idx = hidden.indexOf(cb.dataset.phase);
+      if (cb.checked && idx !== -1) hidden.splice(idx, 1);
+      if (!cb.checked && idx === -1) hidden.push(cb.dataset.phase);
+      setHidden(source, hidden);
+      applyVisibility(source);
+    });
+  });
+  document.addEventListener("click", function (e) {
+    document.querySelectorAll(".cols-menu.open").forEach(function (menu) {
+      if (!menu.parentElement.contains(e.target)) menu.classList.remove("open");
+    });
+  });
+  var sources = new Set();
+  document.querySelectorAll(".column[data-source]").forEach(function (c) { sources.add(c.dataset.source); });
+  sources.forEach(applyVisibility);
+})();
+</script>`;
+
 const SNIPPET_LIMIT = 6000;
 
 // The openspec CLI's built-in "spec-driven" schema only knows these four
@@ -469,7 +511,7 @@ function renderBoard(source, sourceItems) {
         .sort((a, b) => (b.updated || 0) - (a.updated || 0))
         .map(renderCard)
         .join("\n");
-      return `<div class="column">
+      return `<div class="column" data-source="${source}" data-phase="${escapeHtml(label)}">
         <div class="col-head${isOptional ? " col-optional" : ""}${isLast ? " col-archive" : ""}">
           <span class="col-title">${label}</span>
           <span class="col-count">${byPhase[idx].length}</span>
@@ -486,10 +528,23 @@ function renderBoard(source, sourceItems) {
         : '<span class="cli-badge">openspec CLI not found — file-based status</span>'
       : "";
 
+  const columnsMenu = `<div class="columns-toggle">
+    <button type="button" class="cols-btn" onclick="this.nextElementSibling.classList.toggle('open')">Columns ▾</button>
+    <div class="cols-menu">
+      ${phaseLabels
+        .map(
+          (label) =>
+            `<label><input type="checkbox" checked data-source="${source}" data-phase="${escapeHtml(label)}">${label}</label>`
+        )
+        .join("\n")}
+    </div>
+  </div>`;
+
   return `<section class="board-section">
     <div class="board-title-row">
       <h2 class="board-title">${source}</h2>
       ${cliNote}
+      ${columnsMenu}
     </div>
     <div class="board">${columns}</div>
   </section>`;
@@ -565,6 +620,12 @@ function render(root, items, { live = false } = {}) {
   .board-title { font-size: 0.9rem; margin: 0; color: var(--muted); }
   .cli-badge { font-size: 0.68rem; padding: 2px 9px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
   .cli-badge.precise { border-color: var(--accent); color: var(--accent); background: var(--accent-tint); }
+  .columns-toggle { position: relative; margin-left: auto; }
+  .cols-btn { font-size: 0.72rem; padding: 4px 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface); color: var(--muted); cursor: pointer; }
+  .cols-btn:hover { color: var(--accent); border-color: var(--accent); }
+  .cols-menu { display: none; position: absolute; right: 0; top: calc(100% + 6px); background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; z-index: 10; box-shadow: 0 6px 18px rgba(0,0,0,0.25); min-width: 150px; }
+  .cols-menu.open { display: block; }
+  .cols-menu label { display: flex; align-items: center; gap: 6px; font-size: 0.78rem; padding: 3px 0; cursor: pointer; white-space: nowrap; }
   .board-section + .board-section { margin-top: 32px; }
   .board { display: flex; gap: 16px; overflow-x: auto; padding-bottom: 8px; }
   .column { flex: 1 1 220px; min-width: 220px; display: flex; flex-direction: column; gap: 12px; }
@@ -639,6 +700,7 @@ function render(root, items, { live = false } = {}) {
     ${boards || '<p class="empty">No openspec/changes or specs/*/spec.md found here.</p>'}
   </div>
   ${detailViews}
+  ${COLUMNS_TOGGLE_SCRIPT}
   ${live ? LIVE_RELOAD_SCRIPT : ""}
 </body>
 </html>`;
@@ -845,6 +907,11 @@ async function runSelfCheck() {
   // back to file-based phase detection rather than hang or throw.
   assert.ok(!hasOpenSpecCli(), "test assumes no real openspec CLI on PATH");
   assert.ok(html.includes("openspec CLI not found"), "should show the file-based fallback badge when the CLI is absent");
+
+  const colCheckboxCount = (html.match(/<input type="checkbox" checked data-source="OpenSpec"/g) || []).length;
+  assert.strictEqual(colCheckboxCount, active.phases.length, "columns menu should list one checkbox per phase");
+  assert.ok(html.includes('class="column" data-source="OpenSpec" data-phase="Proposal"'), "each column should be taggable by source+phase for the hide/show script");
+  assert.ok(html.includes("spec-ui:hidden-phases:"), "columns-toggle script with its localStorage key should be embedded");
 
   await testLiveReload(root);
 
