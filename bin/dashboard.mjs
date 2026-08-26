@@ -102,6 +102,24 @@ const PROJECT_SWITCH_SCRIPT = `<script>
       switchProject(input ? input.value.trim() : "");
     });
   });
+  document.querySelectorAll(".project-browse").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      btn.disabled = true;
+      var original = btn.textContent;
+      btn.textContent = "Waiting for folder picker…";
+      fetch("/pick-folder")
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          btn.disabled = false;
+          btn.textContent = original;
+          if (data.path) switchProject(data.path);
+        })
+        .catch(function () {
+          btn.disabled = false;
+          btn.textContent = original;
+        });
+    });
+  });
 })();
 </script>`;
 
@@ -698,7 +716,10 @@ function renderProjectSwitcher(root, live) {
     <div class="cols-menu">
       ${items || '<div class="project-empty">No other recent projects</div>'}
       <div class="project-add">
-        <input type="text" class="project-input" placeholder="Paste a project path…">
+        <button type="button" class="project-browse">Browse…</button>
+      </div>
+      <div class="project-add">
+        <input type="text" class="project-input" placeholder="…or paste a path">
         <button type="button" class="project-go">Open</button>
       </div>
     </div>
@@ -776,6 +797,9 @@ function render(root, items, { live = false } = {}) {
   .project-input { flex: 1; min-width: 160px; font-family: inherit; font-size: 0.76rem; padding: 4px 7px; border-radius: 5px; border: 1px solid var(--border); background: var(--bg); color: var(--text); }
   .project-go { font-size: 0.76rem; padding: 4px 9px; border-radius: 5px; border: 1px solid var(--border); background: var(--surface); color: var(--accent); cursor: pointer; }
   .project-go:hover { border-color: var(--accent); background: var(--accent-tint); }
+  .project-browse { width: 100%; font-family: inherit; font-size: 0.76rem; padding: 5px 9px; border-radius: 5px; border: 1px solid var(--border); background: var(--surface); color: var(--accent); cursor: pointer; }
+  .project-browse:hover { border-color: var(--accent); background: var(--accent-tint); }
+  .project-browse:disabled { opacity: 0.6; cursor: default; }
   .board-section + .board-section { margin-top: 32px; }
   .board { display: flex; gap: 16px; overflow-x: auto; padding-bottom: 8px; }
   .column { flex: 1 1 220px; min-width: 220px; display: flex; flex-direction: column; gap: 12px; }
@@ -891,6 +915,63 @@ function spawnDetached(cmd, args, opts = {}) {
       resolve(true);
     });
   });
+}
+
+// Runs a command and captures stdout, distinguishing "binary not found"
+// (try the next candidate) from "ran fine but produced nothing" (user
+// cancelled a picker dialog — that's a final answer, don't try another tool).
+function runAndCapture(cmd, args, timeoutMs) {
+  return new Promise((resolvePromise) => {
+    let child;
+    try {
+      child = spawn(cmd, args);
+    } catch {
+      resolvePromise({ notFound: true, path: null });
+      return;
+    }
+    let out = "";
+    child.stdout.on("data", (d) => (out += d));
+    const timer = setTimeout(() => {
+      child.kill();
+      resolvePromise({ notFound: false, path: null });
+    }, timeoutMs);
+    child.once("error", (err) => {
+      clearTimeout(timer);
+      resolvePromise({ notFound: err.code === "ENOENT", path: null });
+    });
+    child.once("close", (code) => {
+      clearTimeout(timer);
+      const path = out.trim();
+      resolvePromise({ notFound: false, path: code === 0 && path ? path : null });
+    });
+  });
+}
+
+// Opens the OS's real folder picker (Finder/Explorer/native GTK-or-KDE
+// dialog) and resolves the chosen absolute path, or null if cancelled/
+// unavailable. Async (spawn, not execSync) so a five-minute dialog doesn't
+// block the rest of the --live server. 5-minute cap is generous for a human.
+const FOLDER_PICKER_TIMEOUT = 5 * 60 * 1000;
+async function pickFolderNative() {
+  if (process.platform === "darwin") {
+    const r = await runAndCapture("osascript", ["-e", "POSIX path of (choose folder)"], FOLDER_PICKER_TIMEOUT);
+    return r.path;
+  }
+  if (process.platform === "win32") {
+    const script =
+      "Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.FolderBrowserDialog; if ($f.ShowDialog() -eq 'OK') { Write-Output $f.SelectedPath }";
+    const r = await runAndCapture("powershell", ["-NoProfile", "-Command", script], FOLDER_PICKER_TIMEOUT);
+    return r.path;
+  }
+  const candidates = [
+    ["zenity", ["--file-selection", "--directory"]],
+    ["kdialog", ["--getexistingdirectory", homedir()]],
+  ];
+  for (const [cmd, args] of candidates) {
+    const r = await runAndCapture(cmd, args, FOLDER_PICKER_TIMEOUT);
+    if (!r.notFound) return r.path; // this tool exists — its answer (path or cancel) is final
+  }
+  return null;
 }
 
 let RECENT_PROJECTS_FILE = join(homedir(), ".spec-ui", "recent-projects.json");
@@ -1030,6 +1111,12 @@ function startLiveServer(root, { port = 4949, open = true, notifyOnChange = true
       const ok = await (url.pathname === "/open-folder" ? openFolder(currentRoot) : openTerminal(currentRoot));
       res.writeHead(ok ? 200 : 500, { "Content-Type": "text/plain" });
       res.end(ok ? "ok" : "failed");
+      return;
+    }
+    if (url.pathname === "/pick-folder") {
+      const picked = await pickFolderNative();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ path: picked }));
       return;
     }
     if (url.pathname === "/switch-project") {
@@ -1227,7 +1314,9 @@ async function testLiveReload(root) {
 
   const pageRes = await fetch(`http://localhost:${port}/`);
   assert.strictEqual(pageRes.status, 200);
-  assert.ok((await pageRes.text()).includes("EventSource"), "live page should include the reload script");
+  const pageText = await pageRes.text();
+  assert.ok(pageText.includes("EventSource"), "live page should include the reload script");
+  assert.ok(pageText.includes('class="project-browse"'), "live page should offer the native folder-picker button");
 
   const controller = new AbortController();
   const sseRes = await fetch(`http://localhost:${port}/events`, { signal: controller.signal });
