@@ -318,19 +318,40 @@ function renderCard(item) {
   </div>`;
 }
 
+// CSS-only tabs: radios + labels + :nth-of-type sibling selectors, no JS.
+// Rules are index-based (not slug-based) so one static CSS block, generated
+// once in render()'s <style>, covers every item's tab group.
+const MAX_TABS = 10;
+function tabsCss() {
+  let css = "";
+  for (let i = 1; i <= MAX_TABS; i++) {
+    css += `.tabs input.tab-radio:nth-of-type(${i}):checked ~ .tab-bar .tab-label:nth-of-type(${i}),\n`;
+  }
+  css = css.slice(0, -2) + " {\n    background: var(--accent-tint); border-color: var(--accent); color: var(--accent);\n  }\n";
+  for (let i = 1; i <= MAX_TABS; i++) {
+    css += `.tabs input.tab-radio:nth-of-type(${i}):checked ~ .tab-panels .tab-panel:nth-of-type(${i}),\n`;
+  }
+  css = css.slice(0, -2) + " { display: block; }\n";
+  return css;
+}
+
 function renderDetailView(item) {
   const slug = slugify(item.source, item.name);
   const steps = item.phases
     .map((p) => `<span class="detail-step${p.done ? " done" : ""}">${p.label}</span>`)
     .join("");
-  const sections = item.files
-    .map(
-      (f) => `<section class="detail-section">
-        <h2>${f.label}</h2>
-        ${mdToHtml(readSnippet(f.path))}
-      </section>`
-    )
-    .join("\n");
+
+  const tabs = item.files.length
+    ? `<div class="tabs">
+        ${item.files.map((_, i) => `<input type="radio" class="tab-radio" name="tabs-${slug}" id="tab-${slug}-${i}"${i === 0 ? " checked" : ""}>`).join("\n")}
+        <div class="tab-bar">
+          ${item.files.map((f, i) => `<label class="tab-label" for="tab-${slug}-${i}">${f.label}</label>`).join("\n")}
+        </div>
+        <div class="tab-panels">
+          ${item.files.map((f) => `<div class="tab-panel">${mdToHtml(readSnippet(f.path))}</div>`).join("\n")}
+        </div>
+      </div>`
+    : '<p class="empty">No readable files for this change yet.</p>';
 
   return `<div class="detail-view" id="detail-${slug}">
     <a class="detail-back" href="#">← Back to board</a>
@@ -339,7 +360,7 @@ function renderDetailView(item) {
       <h1>${item.name}</h1>
       <div class="detail-steps">${steps}</div>
     </div>
-    ${sections || '<p class="empty">No readable files for this change yet.</p>'}
+    ${tabs}
   </div>`;
 }
 
@@ -471,21 +492,26 @@ function render(root, items, { live = false } = {}) {
   .detail-steps { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
   .detail-step { font-size: 0.72rem; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
   .detail-step.done { background: var(--accent-tint); border-color: var(--accent); color: var(--accent); }
-  .detail-section { max-width: 760px; margin: 32px auto 0; }
-  .detail-section h2 { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); border-bottom: 1px solid var(--border); padding-bottom: 8px; margin: 0 0 14px; }
-  .detail-section h3, .detail-section h4, .detail-section h5 { margin: 20px 0 8px; }
-  .detail-section p { line-height: 1.6; margin: 0 0 12px; }
-  .detail-section ul, .detail-section ol { padding-left: 22px; line-height: 1.6; margin: 0 0 12px; }
-  .detail-section .md-tasks { list-style: none; padding-left: 0; }
-  .detail-section .md-task { display: flex; align-items: baseline; gap: 8px; padding: 2px 0; }
-  .detail-section .md-task.done span { color: var(--muted); text-decoration: line-through; }
-  .detail-section code { background: var(--accent-tint); padding: 1px 5px; border-radius: 4px; font-size: 0.85em; }
-  .detail-section pre.md-code { background: var(--accent-tint); padding: 12px; border-radius: 8px; overflow-x: auto; }
-  .detail-section pre.md-code code { background: none; padding: 0; }
-  .detail-section a { color: var(--accent); }
-  .detail-section table.md-table { width: 100%; border-collapse: collapse; margin: 0 0 16px; font-size: 0.85rem; }
-  .detail-section table.md-table th, .detail-section table.md-table td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; vertical-align: top; }
-  .detail-section table.md-table th { background: var(--accent-tint); font-weight: 600; }
+  .tabs { max-width: 760px; margin: 28px auto 0; }
+  .tab-radio { position: absolute; opacity: 0; width: 0; height: 0; }
+  .tab-bar { display: flex; flex-wrap: wrap; gap: 6px; border-bottom: 1px solid var(--border); padding-bottom: 12px; margin-bottom: 24px; }
+  .tab-label { font-size: 0.78rem; font-weight: 600; padding: 5px 13px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); cursor: pointer; user-select: none; }
+  .tab-label:hover { color: var(--accent); border-color: var(--accent); }
+  .tab-panel { display: none; }
+  ${tabsCss()}
+  .tab-panel h1, .tab-panel h2, .tab-panel h3, .tab-panel h4, .tab-panel h5 { margin: 20px 0 8px; }
+  .tab-panel p { line-height: 1.6; margin: 0 0 12px; }
+  .tab-panel ul, .tab-panel ol { padding-left: 22px; line-height: 1.6; margin: 0 0 12px; }
+  .tab-panel .md-tasks { list-style: none; padding-left: 0; }
+  .tab-panel .md-task { display: flex; align-items: baseline; gap: 8px; padding: 2px 0; }
+  .tab-panel .md-task.done span { color: var(--muted); text-decoration: line-through; }
+  .tab-panel code { background: var(--accent-tint); padding: 1px 5px; border-radius: 4px; font-size: 0.85em; }
+  .tab-panel pre.md-code { background: var(--accent-tint); padding: 12px; border-radius: 8px; overflow-x: auto; }
+  .tab-panel pre.md-code code { background: none; padding: 0; }
+  .tab-panel a { color: var(--accent); }
+  .tab-panel table.md-table { width: 100%; border-collapse: collapse; margin: 0 0 16px; font-size: 0.85rem; }
+  .tab-panel table.md-table th, .tab-panel table.md-table td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; vertical-align: top; }
+  .tab-panel table.md-table th { background: var(--accent-tint); font-weight: 600; }
 </style>
 </head>
 <body>
