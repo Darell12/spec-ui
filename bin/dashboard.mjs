@@ -246,6 +246,7 @@ function slugify(...parts) {
 function mdInline(text) {
   let out = escapeHtml(text);
   out = out.replace(/`([^`]+)`/g, "<code>$1</code>");
+  out = out.replace(/~~([^~]+)~~/g, "<del>$1</del>");
   out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
   out = out.replace(/(?<!\*)\*([^*]+)\*(?!\*)/g, "<em>$1</em>");
   out = out.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
@@ -295,11 +296,19 @@ function mdToHtml(text) {
     tableBuffer = [];
   };
   const isTableRow = (line) => /^\s*\|.*\|\s*$/.test(line);
+  const isHr = (line) => /^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$/.test(line);
+
+  let quoteBuffer = [];
+  const flushQuote = () => {
+    if (quoteBuffer.length) html += `<blockquote><p>${mdInline(quoteBuffer.join(" "))}</p></blockquote>\n`;
+    quoteBuffer = [];
+  };
 
   for (const line of lines) {
     if (line.trim().startsWith("```")) {
       flushParagraph();
       closeList();
+      flushQuote();
       if (tableBuffer.length) flushTable();
       html += inCode ? "</code></pre>\n" : '<pre class="md-code"><code>';
       inCode = !inCode;
@@ -311,6 +320,7 @@ function mdToHtml(text) {
     }
 
     if (isTableRow(line)) {
+      flushQuote();
       tableBuffer.push(line);
       continue;
     }
@@ -320,14 +330,32 @@ function mdToHtml(text) {
       flushTable();
     }
 
+    if (isHr(line)) {
+      flushParagraph();
+      closeList();
+      flushQuote();
+      html += "<hr>\n";
+      continue;
+    }
+
     const heading = line.match(/^(#{1,4})\s+(.*)/);
     if (heading) {
       flushParagraph();
       closeList();
+      flushQuote();
       const level = heading[1].length + 1;
       html += `<h${level} class="md-h${heading[1].length}">${mdInline(heading[2])}</h${level}>\n`;
       continue;
     }
+
+    const quote = line.match(/^[ \t]*>[ \t]?(.*)/);
+    if (quote) {
+      flushParagraph();
+      closeList();
+      quoteBuffer.push(quote[1]);
+      continue;
+    }
+    if (quoteBuffer.length) flushQuote();
 
     const checkbox = line.match(/^[ \t]*-\s*\[([ xX])\]\s+(.*)/);
     if (checkbox) {
@@ -369,6 +397,7 @@ function mdToHtml(text) {
     if (line.trim() === "") {
       flushParagraph();
       closeList();
+      flushQuote();
       continue;
     }
 
@@ -376,6 +405,7 @@ function mdToHtml(text) {
   }
   flushParagraph();
   closeList();
+  flushQuote();
   if (tableBuffer.length) flushTable();
   if (inCode) html += "</code></pre>\n";
   return html;
@@ -855,6 +885,10 @@ function render(root, items, { live = false } = {}) {
   .tab-panel pre.md-code { background: var(--accent-tint); padding: 12px; border-radius: 8px; overflow-x: auto; }
   .tab-panel pre.md-code code { background: none; padding: 0; }
   .tab-panel a { color: var(--accent); }
+  .tab-panel hr { border: none; border-top: 1px solid var(--border); margin: 24px 0; }
+  .tab-panel blockquote { margin: 0 0 12px; padding: 4px 14px; border-left: 3px solid var(--accent); color: var(--muted); }
+  .tab-panel blockquote p { margin: 0; }
+  .tab-panel del { color: var(--muted); }
   .tab-panel table.md-table { width: 100%; border-collapse: collapse; margin: 0 0 16px; font-size: 0.85rem; }
   .tab-panel table.md-table th, .tab-panel table.md-table td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; vertical-align: top; }
   .tab-panel table.md-table th { background: var(--accent-tint); font-weight: 600; }
@@ -1229,6 +1263,17 @@ async function runSelfCheck() {
 
   const table = mdToHtml("| Area | Impact |\n|------|--------|\n| a.ts | New |\n");
   assert.ok(table.includes("<table") && table.includes("<th>Area</th>") && table.includes("<td>New</td>"), "markdown tables should render as tables, not raw pipes");
+
+  const hrHtml = mdToHtml("Before\n\n---\n\nAfter\n");
+  assert.ok(hrHtml.includes("<hr>"), "a standalone --- line should render as a horizontal rule");
+  assert.ok(!hrHtml.includes("<li>-</li>") && !hrHtml.includes(">---<"), "the --- itself should not leak into a list item or paragraph");
+
+  const strikeHtml = mdToHtml("7. ~~Align the route shape~~ — resolved in design.\n");
+  assert.ok(strikeHtml.includes("<del>Align the route shape</del>"), "~~text~~ should render as strikethrough, not literal tildes");
+
+  const quoteHtml = mdToHtml("> Note: this is a callout.\n> Second line.\n\nAfter.\n");
+  assert.ok(quoteHtml.includes("<blockquote>") && quoteHtml.includes("Note: this is a callout. Second line."), "consecutive > lines should join into one blockquote");
+  assert.ok(!quoteHtml.includes("&gt;"), "blockquote markers should not leak through as literal text");
 
   const tasksMd = [
     "# Tasks: Sample",
