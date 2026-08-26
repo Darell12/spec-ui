@@ -481,7 +481,7 @@ function render(root, items, { live = false } = {}) {
     }
   }
   * { box-sizing: border-box; }
-  body { margin: 0; font-family: -apple-system, system-ui, sans-serif; background: var(--bg); color: var(--text); }
+  body { margin: 0; font-family: "SF Mono", "Cascadia Code", "Cascadia Mono", Consolas, "JetBrains Mono", "Liberation Mono", Menlo, Monaco, "Courier New", monospace; line-height: 1.5; background: var(--bg); color: var(--text); }
   .page { padding: 28px 32px 40px; }
   .page-header { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 4px; }
   .page-header h1 { font-size: 1.35rem; margin: 0; }
