@@ -12,6 +12,42 @@ const LIVE_RELOAD_SCRIPT = `<script>new EventSource('/events').onmessage = () =>
 
 const SNIPPET_LIMIT = 6000;
 
+// The openspec CLI's built-in "spec-driven" schema only knows these four
+// artifacts — Verify/Archive are this tool's own extension, so they always
+// fall back to the file-presence heuristic below regardless of CLI status.
+const OPENSPEC_ARTIFACT_TO_PHASE = { proposal: "Proposal", specs: "Spec", design: "Design", tasks: "Tasks" };
+
+let cliAvailable = null;
+function hasOpenSpecCli() {
+  if (cliAvailable === null) {
+    try {
+      execSync("openspec --version", { stdio: "ignore", timeout: 3000 });
+      cliAvailable = true;
+    } catch {
+      cliAvailable = false;
+    }
+  }
+  return cliAvailable;
+}
+
+// Returns { proposal: "done"|"ready"|"blocked"|"skipped", ... } or null if the
+// CLI call fails (not installed, change unknown to it, timeout, bad JSON).
+function getCliArtifactStatus(root, changeName) {
+  try {
+    const out = execSync(`openspec status --change ${JSON.stringify(changeName)} --json`, {
+      cwd: root,
+      timeout: 5000,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    const data = JSON.parse(out.toString("utf8"));
+    const byId = {};
+    for (const a of data.artifacts || []) byId[a.id] = a.status;
+    return byId;
+  } catch {
+    return null;
+  }
+}
+
 function countTasksInText(text) {
   const total = (text.match(/^[ \t]*-\s*\[[ xX]\]/gm) || []).length;
   const done = (text.match(/^[ \t]*-\s*\[[xX]\]/gm) || []).length;
@@ -251,6 +287,24 @@ function scanOpenSpec(root) {
           { label: "Verify", done: !!files.verify },
           { label: "Archive", done: archived },
         ];
+
+        // Non-archived changes: ask the CLI for authoritative status when
+        // available — it's the only source that knows about skip_specs etc.
+        if (!archived && hasOpenSpecCli()) {
+          const cliStatus = getCliArtifactStatus(root, d.name);
+          if (cliStatus) {
+            for (const phase of phases) {
+              const artifactId = Object.keys(OPENSPEC_ARTIFACT_TO_PHASE).find(
+                (id) => OPENSPEC_ARTIFACT_TO_PHASE[id] === phase.label
+              );
+              const status = artifactId && cliStatus[artifactId];
+              if (!status) continue;
+              phase.skipped = status === "skipped";
+              phase.done = status === "done" || status === "skipped";
+            }
+          }
+        }
+
         return {
           source: "OpenSpec",
           name: d.name,
@@ -373,7 +427,10 @@ function tabsCss() {
 function renderDetailView(item) {
   const slug = slugify(item.source, item.name);
   const steps = item.phases
-    .map((p) => `<span class="detail-step${p.done ? " done" : ""}">${p.label}</span>`)
+    .map(
+      (p) =>
+        `<span class="detail-step${p.done ? " done" : ""}${p.skipped ? " skipped" : ""}">${p.label}${p.skipped ? " (skipped)" : ""}</span>`
+    )
     .join("");
 
   const tabs = item.files.length
@@ -422,8 +479,18 @@ function renderBoard(source, sourceItems) {
     })
     .join("\n");
 
+  const cliNote =
+    source === "OpenSpec"
+      ? hasOpenSpecCli()
+        ? '<span class="cli-badge precise">openspec CLI detected — precise status</span>'
+        : '<span class="cli-badge">openspec CLI not found — file-based status</span>'
+      : "";
+
   return `<section class="board-section">
-    <h2 class="board-title">${source}</h2>
+    <div class="board-title-row">
+      <h2 class="board-title">${source}</h2>
+      ${cliNote}
+    </div>
     <div class="board">${columns}</div>
   </section>`;
 }
@@ -494,7 +561,10 @@ function render(root, items, { live = false } = {}) {
   .icon-btn { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border: 1px solid var(--border); background: var(--surface); color: var(--muted); border-radius: 6px; cursor: pointer; padding: 0; }
   .icon-btn:hover { color: var(--accent); border-color: var(--accent); background: var(--accent-tint); }
   .icon-btn svg { width: 13px; height: 13px; }
-  .board-title { font-size: 0.9rem; margin: 0 0 12px; color: var(--muted); }
+  .board-title-row { display: flex; align-items: center; gap: 10px; margin: 0 0 12px; }
+  .board-title { font-size: 0.9rem; margin: 0; color: var(--muted); }
+  .cli-badge { font-size: 0.68rem; padding: 2px 9px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
+  .cli-badge.precise { border-color: var(--accent); color: var(--accent); background: var(--accent-tint); }
   .board-section + .board-section { margin-top: 32px; }
   .board { display: flex; gap: 16px; overflow-x: auto; padding-bottom: 8px; }
   .column { flex: 1 1 220px; min-width: 220px; display: flex; flex-direction: column; gap: 12px; }
@@ -527,6 +597,7 @@ function render(root, items, { live = false } = {}) {
   .detail-steps { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
   .detail-step { font-size: 0.72rem; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
   .detail-step.done { background: var(--accent-tint); border-color: var(--accent); color: var(--accent); }
+  .detail-step.skipped { border-style: dashed; background: transparent; }
   .tabs { max-width: 760px; margin: 28px auto 0; }
   .tab-radio { position: absolute; opacity: 0; width: 0; height: 0; }
   .tab-bar { display: flex; flex-wrap: wrap; gap: 6px; border-bottom: 1px solid var(--border); padding-bottom: 12px; margin-bottom: 24px; }
@@ -769,6 +840,11 @@ async function runSelfCheck() {
   assert.ok(phased.match(/<span class="phase-count">1\/2<\/span>/), "phase 0 should count 1 of 2 tasks done");
   assert.ok(phased.match(/<span class="phase-count">2\/2<\/span>/), "phase 1 should count 2 of 2 tasks done");
   assert.strictEqual(renderTasksPanel("- [x] no phases here\n"), mdToHtml("- [x] no phases here\n"), "no Phase headings should fall back to plain rendering");
+
+  // This environment has no openspec CLI on PATH, so the dashboard must fall
+  // back to file-based phase detection rather than hang or throw.
+  assert.ok(!hasOpenSpecCli(), "test assumes no real openspec CLI on PATH");
+  assert.ok(html.includes("openspec CLI not found"), "should show the file-based fallback badge when the CLI is absent");
 
   await testLiveReload(root);
 
