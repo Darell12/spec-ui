@@ -3,8 +3,8 @@
 // Usage: node bin/dashboard.mjs [projectRoot] [--test] [--no-open] [--live]
 
 import { readdirSync, readFileSync, statSync, existsSync, writeFileSync, watch } from "node:fs";
-import { join, basename } from "node:path";
-import { execSync } from "node:child_process";
+import { join, basename, resolve } from "node:path";
+import { execSync, spawn } from "node:child_process";
 import { createServer } from "node:http";
 import assert from "node:assert";
 
@@ -206,7 +206,7 @@ function renderBoard(source, sourceItems) {
           <span class="col-title">${label}</span>
           <span class="col-count">${byPhase[idx].length}</span>
         </div>
-        <div class="col-body">${cards || '<div class="col-empty">Nada acá</div>'}</div>
+        <div class="col-body">${cards || '<div class="col-empty">Nothing here</div>'}</div>
       </div>`;
     })
     .join("\n");
@@ -215,6 +215,21 @@ function renderBoard(source, sourceItems) {
     <h2 class="board-title">${source}</h2>
     <div class="board">${columns}</div>
   </section>`;
+}
+
+function renderProjectLink(root, live) {
+  const name = escapeHtml(basename(root));
+  const tooltip = escapeHtml(root);
+  if (!live) {
+    return `<a class="project-name" href="file://${encodeURI(root)}" title="${tooltip}">${name}</a>`;
+  }
+  return `<span class="project-name" title="${tooltip}">${name}</span>
+    <button type="button" class="icon-btn" title="Open folder" onclick="fetch('/open-folder').then(r=>{if(!r.ok)alert('Could not open the folder')})">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/></svg>
+    </button>
+    <button type="button" class="icon-btn" title="Open in terminal" onclick="fetch('/open-terminal').then(r=>{if(!r.ok)alert('No compatible terminal found')})">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1Z"/><path d="M6.5 9.5 9 12l-2.5 2.5M12 15h5"/></svg>
+    </button>`;
 }
 
 function render(root, items, { live = false } = {}) {
@@ -261,7 +276,12 @@ function render(root, items, { live = false } = {}) {
   .live-badge { display: inline-flex; align-items: center; gap: 6px; font-size: 0.78rem; color: var(--accent); font-weight: 600; }
   .live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); animation: pulse 1.8s ease-in-out infinite; }
   @keyframes pulse { 0%, 100% { box-shadow: 0 0 0 0 var(--accent-glow); } 50% { box-shadow: 0 0 0 5px transparent; } }
-  .page-sub { color: var(--muted); font-size: 0.82rem; margin: 0 0 22px; }
+  .page-sub { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 0.82rem; margin: 0 0 22px; }
+  .project-name { color: var(--text); font-weight: 600; text-decoration: none; }
+  a.project-name:hover { color: var(--accent); }
+  .icon-btn { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border: 1px solid var(--border); background: var(--surface); color: var(--muted); border-radius: 6px; cursor: pointer; padding: 0; }
+  .icon-btn:hover { color: var(--accent); border-color: var(--accent); background: var(--accent-tint); }
+  .icon-btn svg { width: 13px; height: 13px; }
   .board-title { font-size: 0.9rem; margin: 0 0 12px; color: var(--muted); }
   .board-section + .board-section { margin-top: 32px; }
   .board { display: flex; gap: 16px; overflow-x: auto; padding-bottom: 8px; }
@@ -294,7 +314,7 @@ function render(root, items, { live = false } = {}) {
       <h1>Specs Dashboard</h1>
       ${live ? '<span class="live-badge"><span class="live-dot"></span>Live</span>' : ""}
     </div>
-    <div class="page-sub">${root} — generated ${new Date().toLocaleString()}</div>
+    <div class="page-sub">${renderProjectLink(root, live)}<span>·</span><span>generated ${new Date().toLocaleString()}</span></div>
     ${boards || '<p class="empty">No openspec/changes or specs/*/spec.md found here.</p>'}
   </div>
   ${live ? LIVE_RELOAD_SCRIPT : ""}
@@ -309,6 +329,51 @@ function openInBrowser(target) {
   } catch {
     console.log(`Could not auto-open browser, open ${target} manually.`);
   }
+}
+
+// Fire-and-forget spawn that resolves true only once the child process has
+// actually started — spawn() itself never throws for a missing binary, the
+// failure arrives async as an "error" event, so we can't just try/catch it.
+function spawnDetached(cmd, args, opts = {}) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(cmd, args, { stdio: "ignore", detached: true, ...opts });
+    } catch {
+      resolve(false);
+      return;
+    }
+    child.once("error", () => resolve(false));
+    child.once("spawn", () => {
+      child.unref();
+      resolve(true);
+    });
+  });
+}
+
+function openFolder(root) {
+  if (process.platform === "darwin") return spawnDetached("open", [root]);
+  if (process.platform === "win32") return spawnDetached("explorer", [root]);
+  return spawnDetached("xdg-open", [root]);
+}
+
+// ponytail: Linux has no single standard terminal — try the common ones in
+// order and stop at the first that actually launches.
+async function openTerminal(root) {
+  if (process.platform === "darwin") return spawnDetached("open", ["-a", "Terminal", root]);
+  if (process.platform === "win32") return spawnDetached("cmd.exe", ["/c", "start", "cmd.exe"], { cwd: root });
+
+  const candidates = [
+    ["gnome-terminal", [`--working-directory=${root}`]],
+    ["konsole", ["--workdir", root]],
+    ["xfce4-terminal", [`--working-directory=${root}`]],
+    ["x-terminal-emulator", [], { cwd: root }],
+    ["xterm", [], { cwd: root }],
+  ];
+  for (const [cmd, args, opts = {}] of candidates) {
+    if (await spawnDetached(cmd, args, opts)) return true;
+  }
+  return false;
 }
 
 // ponytail: recursive fs.watch works on macOS/Windows out of the box; Linux needs
@@ -330,7 +395,7 @@ function startLiveServer(root, { port = 4949, open = true } = {}) {
   const watchDirs = [join(root, "openspec"), join(root, "specs")].filter(existsSync);
   const watchers = watchDirs.map((dir) => watch(dir, { recursive: true }, scheduleRefresh));
 
-  const server = createServer((req, res) => {
+  const server = createServer(async (req, res) => {
     if (req.url === "/events") {
       res.writeHead(200, {
         "Content-Type": "text/event-stream",
@@ -344,6 +409,12 @@ function startLiveServer(root, { port = 4949, open = true } = {}) {
         clearInterval(heartbeat);
         clients.delete(res);
       });
+      return;
+    }
+    if (req.url === "/open-folder" || req.url === "/open-terminal") {
+      const ok = await (req.url === "/open-folder" ? openFolder(root) : openTerminal(root));
+      res.writeHead(ok ? 200 : 500, { "Content-Type": "text/plain" });
+      res.end(ok ? "ok" : "failed");
       return;
     }
     const items = [...scanOpenSpec(root), ...scanSpecKit(root)];
@@ -463,7 +534,7 @@ async function main() {
     return;
   }
 
-  const root = args.find((a) => !a.startsWith("--")) || process.cwd();
+  const root = resolve(args.find((a) => !a.startsWith("--")) || process.cwd());
 
   if (args.includes("--live")) {
     startLiveServer(root, { open: !args.includes("--no-open") });
