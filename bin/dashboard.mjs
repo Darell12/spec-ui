@@ -123,8 +123,6 @@ const PROJECT_SWITCH_SCRIPT = `<script>
 })();
 </script>`;
 
-const SNIPPET_LIMIT = 6000;
-
 // The openspec CLI's built-in "spec-driven" schema only knows these four
 // artifacts — Verify/Archive are this tool's own extension, so they always
 // fall back to the file-presence heuristic below regardless of CLI status.
@@ -232,11 +230,9 @@ function escapeHtml(str) {
   return str.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
 }
 
-function readSnippet(path) {
+function readFileContent(path) {
   if (!existsSync(path)) return null;
-  const text = readFileSync(path, "utf8");
-  if (text.length <= SNIPPET_LIMIT) return text;
-  return text.slice(0, SNIPPET_LIMIT) + `\n\n… truncated, open ${path} to read the rest.`;
+  return readFileSync(path, "utf8");
 }
 
 function slugify(...parts) {
@@ -648,7 +644,7 @@ function renderDetailView(item) {
           ${item.files.map((f, i) => `<label class="tab-label" for="tab-${slug}-${i}">${f.label}</label>`).join("\n")}
         </div>
         <div class="tab-panels">
-          ${item.files.map((f) => `<div class="tab-panel">${f.label === "Tasks" ? renderTasksPanel(readSnippet(f.path)) : mdToHtml(readSnippet(f.path))}</div>`).join("\n")}
+          ${item.files.map((f) => `<div class="tab-panel">${f.label === "Tasks" ? renderTasksPanel(readFileContent(f.path)) : mdToHtml(readFileContent(f.path))}</div>`).join("\n")}
         </div>
       </div>`
     : '<p class="empty">No readable files for this change yet.</p>';
