@@ -1,3 +1,5 @@
 node_modules/
 .atl/
 specs-dashboard.html
+design/**/*.html
+!design/**/*.dc.html

@@ -144,13 +144,20 @@ const STATUS_LABEL = {
   "no-tasks": "No tasks yet",
 };
 
-function renderPhaseChips(phases) {
-  return phases
-    .map(
-      (p) =>
-        `<span class="chip ${p.done ? "chip-done" : "chip-pending"}${p.optional ? " chip-optional" : ""}">${p.label}</span>`
-    )
-    .join("");
+// A card sits in the column of its first incomplete phase — once every
+// phase is done (including Archive) it settles in the last column.
+function currentPhaseIndex(item) {
+  const idx = item.phases.findIndex((p) => !p.done);
+  return idx === -1 ? item.phases.length - 1 : idx;
+}
+
+function groupBySource(items) {
+  const bySource = new Map();
+  for (const item of items) {
+    if (!bySource.has(item.source)) bySource.set(item.source, []);
+    bySource.get(item.source).push(item);
+  }
+  return bySource;
 }
 
 function renderFiles(files) {
@@ -166,28 +173,53 @@ function renderFiles(files) {
     .join("\n");
 }
 
-function render(root, items, { live = false } = {}) {
-  const rows = items
-    .sort((a, b) => (b.updated || 0) - (a.updated || 0))
-    .map((item) => {
-      const status = statusOf(item);
-      const pct = item.tasks && item.tasks.total ? Math.round((item.tasks.done / item.tasks.total) * 100) : 0;
-      const taskLabel = item.tasks ? `${item.tasks.done}/${item.tasks.total} tasks` : "no tasks.md";
-      return `<div class="card status-${status}">
-        <div class="card-head">
-          <span class="badge badge-${item.source.toLowerCase()}">${item.source}</span>
-          <h3>${item.name}</h3>
+function renderCard(item) {
+  const status = statusOf(item);
+  const pct = item.tasks && item.tasks.total ? Math.round((item.tasks.done / item.tasks.total) * 100) : 0;
+  const taskLabel = item.tasks ? `${item.tasks.done}/${item.tasks.total} tasks` : "no tasks.md";
+  return `<div class="card status-${status}">
+    <h3 class="card-name">${item.name}</h3>
+    <div class="bar"><div class="bar-fill" style="width:${pct}%"></div></div>
+    <div class="meta">
+      <span>${taskLabel}</span>
+      <span>${item.updated ? item.updated.toLocaleDateString() : ""}</span>
+    </div>
+    <div class="files">${renderFiles(item.files)}</div>
+  </div>`;
+}
+
+function renderBoard(source, sourceItems) {
+  const phaseLabels = sourceItems[0].phases.map((p) => p.label);
+  const byPhase = phaseLabels.map(() => []);
+  for (const item of sourceItems) byPhase[currentPhaseIndex(item)].push(item);
+
+  const columns = phaseLabels
+    .map((label, idx) => {
+      const isOptional = sourceItems[0].phases[idx].optional;
+      const isLast = idx === phaseLabels.length - 1;
+      const cards = byPhase[idx]
+        .sort((a, b) => (b.updated || 0) - (a.updated || 0))
+        .map(renderCard)
+        .join("\n");
+      return `<div class="column">
+        <div class="col-head${isOptional ? " col-optional" : ""}${isLast ? " col-archive" : ""}">
+          <span class="col-title">${label}</span>
+          <span class="col-count">${byPhase[idx].length}</span>
         </div>
-        <div class="chips">${renderPhaseChips(item.phases)}</div>
-        <div class="bar"><div class="bar-fill" style="width:${pct}%"></div></div>
-        <div class="meta">
-          <span>${taskLabel}</span>
-          <span class="status-label">${STATUS_LABEL[status]}</span>
-        </div>
-        <div class="files">${renderFiles(item.files)}</div>
+        <div class="col-body">${cards || '<div class="col-empty">Nada acá</div>'}</div>
       </div>`;
     })
     .join("\n");
+
+  return `<section class="board-section">
+    <h2 class="board-title">${source}</h2>
+    <div class="board">${columns}</div>
+  </section>`;
+}
+
+function render(root, items, { live = false } = {}) {
+  const bySource = groupBySource(items);
+  const boards = [...bySource.entries()].map(([source, sourceItems]) => renderBoard(source, sourceItems)).join("\n");
 
   return `<!doctype html>
 <html lang="en">
@@ -195,40 +227,75 @@ function render(root, items, { live = false } = {}) {
 <meta charset="utf-8">
 <title>Specs Dashboard — ${basename(root)}</title>
 <style>
-  :root { color-scheme: light dark; }
-  body { font-family: -apple-system, system-ui, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; }
-  h1 { font-size: 1.3rem; }
-  .sub { color: #888; font-size: 0.85rem; margin-bottom: 24px; }
-  .grid { display: grid; gap: 14px; }
-  .card { border: 1px solid #8883; border-radius: 10px; padding: 14px 16px; }
-  .card-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
-  .card-head h3 { margin: 0; font-size: 1rem; }
-  .badge { font-size: 0.7rem; padding: 2px 8px; border-radius: 999px; font-weight: 600; }
-  .badge-openspec { background: #6366f133; color: #6366f1; }
-  .badge-speckit { background: #f59e0b33; color: #b45309; }
-  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
-  .chip { font-size: 0.68rem; padding: 2px 8px; border-radius: 6px; border: 1px solid #8884; }
-  .chip-done { background: #22c55e22; border-color: #22c55e55; }
-  .chip-pending { color: #999; }
-  .chip-optional { border-style: dashed; }
-  .bar { background: #8882; border-radius: 999px; height: 6px; overflow: hidden; margin-bottom: 8px; }
-  .bar-fill { background: #22c55e; height: 100%; }
-  .status-no-tasks .bar-fill { background: #9ca3af; }
-  .status-not-started .bar-fill { background: #9ca3af; }
-  .status-in-progress .bar-fill { background: #f59e0b; }
-  .meta { display: flex; justify-content: space-between; font-size: 0.8rem; color: #888; }
-  .empty { color: #888; font-style: italic; }
-  .files { margin-top: 10px; }
-  .files details { border-top: 1px solid #8882; padding: 6px 0; }
-  .files summary { cursor: pointer; font-size: 0.8rem; font-weight: 600; }
-  .files pre { white-space: pre-wrap; font-size: 0.78rem; max-height: 300px; overflow-y: auto; background: #8881; padding: 8px; border-radius: 6px; }
+  :root {
+    --bg: #f7f6f3;
+    --surface: #ffffff;
+    --text: #1a1a1a;
+    --muted: #6b6b6f;
+    --border: rgba(20,20,22,0.14);
+    --accent: #b45309;
+    --accent-hover: #92400e;
+    --accent-tint: rgba(180,83,9,0.08);
+    --accent-tint-strong: rgba(180,83,9,0.12);
+    --accent-glow: rgba(180,83,9,0.45);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0c0d10;
+      --surface: #16171b;
+      --text: #e7e7ea;
+      --muted: #8b8d94;
+      --border: rgba(255,255,255,0.10);
+      --accent: #f2b544;
+      --accent-hover: #ffcc66;
+      --accent-tint: rgba(242,181,68,0.10);
+      --accent-tint-strong: rgba(242,181,68,0.14);
+      --accent-glow: rgba(242,181,68,0.5);
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, system-ui, sans-serif; background: var(--bg); color: var(--text); }
+  .page { padding: 28px 32px 40px; }
+  .page-header { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 4px; }
+  .page-header h1 { font-size: 1.35rem; margin: 0; }
+  .live-badge { display: inline-flex; align-items: center; gap: 6px; font-size: 0.78rem; color: var(--accent); font-weight: 600; }
+  .live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); animation: pulse 1.8s ease-in-out infinite; }
+  @keyframes pulse { 0%, 100% { box-shadow: 0 0 0 0 var(--accent-glow); } 50% { box-shadow: 0 0 0 5px transparent; } }
+  .page-sub { color: var(--muted); font-size: 0.82rem; margin: 0 0 22px; }
+  .board-title { font-size: 0.9rem; margin: 0 0 12px; color: var(--muted); }
+  .board-section + .board-section { margin-top: 32px; }
+  .board { display: flex; gap: 16px; overflow-x: auto; padding-bottom: 8px; }
+  .column { flex: 1 1 220px; min-width: 220px; display: flex; flex-direction: column; gap: 12px; }
+  .col-head { display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; border-radius: 8px; background: var(--accent-tint); border: 1px solid transparent; }
+  .col-head.col-optional { border-style: dashed; border-color: var(--border); background: transparent; }
+  .col-head.col-archive { background: var(--accent-tint-strong); }
+  .col-title { font-size: 0.82rem; font-weight: 700; }
+  .col-count { font-size: 0.7rem; color: var(--muted); background: var(--surface); border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px; }
+  .col-body { display: flex; flex-direction: column; gap: 10px; min-height: 60px; }
+  .col-empty { font-size: 0.76rem; color: var(--muted); font-style: italic; padding: 10px 4px; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; transition: transform 160ms ease, box-shadow 160ms ease; animation: card-enter 260ms ease; }
+  .card:hover { transform: translateY(-2px); box-shadow: 0 6px 18px rgba(0,0,0,0.10); }
+  @keyframes card-enter { from { opacity: 0; transform: translateY(-6px) scale(0.97); } to { opacity: 1; transform: none; } }
+  .card-name { font-size: 0.86rem; font-weight: 600; margin: 0 0 8px; line-height: 1.3; }
+  .bar { background: rgba(136,136,136,0.22); border-radius: 999px; height: 5px; overflow: hidden; margin-bottom: 6px; }
+  .bar-fill { background: var(--accent); height: 100%; }
+  .status-no-tasks .bar-fill, .status-not-started .bar-fill { background: var(--muted); }
+  .meta { display: flex; align-items: center; justify-content: space-between; font-size: 0.7rem; color: var(--muted); }
+  .files { margin-top: 8px; }
+  .files details { border-top: 1px solid var(--border); padding: 6px 0; }
+  .files summary { cursor: pointer; font-size: 0.74rem; font-weight: 600; }
+  .files pre { white-space: pre-wrap; font-size: 0.72rem; max-height: 260px; overflow-y: auto; background: var(--accent-tint); padding: 8px; border-radius: 6px; }
+  .empty { color: var(--muted); font-style: italic; }
 </style>
 </head>
 <body>
-  <h1>Specs Dashboard</h1>
-  <div class="sub">${root} — generated ${new Date().toLocaleString()}</div>
-  <div class="grid">
-    ${rows || '<p class="empty">No openspec/changes or specs/*/spec.md found here.</p>'}
+  <div class="page">
+    <div class="page-header">
+      <h1>Specs Dashboard</h1>
+      ${live ? '<span class="live-badge"><span class="live-dot"></span>Live</span>' : ""}
+    </div>
+    <div class="page-sub">${root} — generated ${new Date().toLocaleString()}</div>
+    ${boards || '<p class="empty">No openspec/changes or specs/*/spec.md found here.</p>'}
   </div>
   ${live ? LIVE_RELOAD_SCRIPT : ""}
 </body>
