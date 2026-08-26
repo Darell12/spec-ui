@@ -613,15 +613,17 @@ function renderCard(item) {
 
 // CSS-only tabs: radios + labels + :nth-of-type sibling selectors, no JS.
 // Rules are index-based (not slug-based) so one static CSS block, generated
-// once in render()'s <style>, covers every item's tab group.
-const MAX_TABS = 10;
-function tabsCss() {
+// once in render()'s <style>, covers every item's tab group. maxTabs is
+// computed per-render from the actual data (see render()) rather than a
+// fixed guess — a change with many spec deltas should never silently get
+// an inert tab past some arbitrary cutoff.
+function tabsCss(maxTabs) {
   let css = "";
-  for (let i = 1; i <= MAX_TABS; i++) {
+  for (let i = 1; i <= maxTabs; i++) {
     css += `.tabs input.tab-radio:nth-of-type(${i}):checked ~ .tab-bar .tab-label:nth-of-type(${i}),\n`;
   }
   css = css.slice(0, -2) + " {\n    background: var(--accent-tint); border-color: var(--accent); color: var(--accent);\n  }\n";
-  for (let i = 1; i <= MAX_TABS; i++) {
+  for (let i = 1; i <= maxTabs; i++) {
     css += `.tabs input.tab-radio:nth-of-type(${i}):checked ~ .tab-panels .tab-panel:nth-of-type(${i}),\n`;
   }
   css = css.slice(0, -2) + " { display: block; }\n";
@@ -756,6 +758,7 @@ function render(root, items, { live = false } = {}) {
   const bySource = groupBySource(items);
   const boards = [...bySource.entries()].map(([source, sourceItems]) => renderBoard(source, sourceItems)).join("\n");
   const detailViews = items.map(renderDetailView).join("\n");
+  const maxTabs = Math.max(1, ...items.map((i) => i.files.length));
 
   return `<!doctype html>
 <html lang="en">
@@ -870,7 +873,7 @@ function render(root, items, { live = false } = {}) {
   .tab-label { font-size: 0.78rem; font-weight: 600; padding: 5px 13px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); cursor: pointer; user-select: none; }
   .tab-label:hover { color: var(--accent); border-color: var(--accent); }
   .tab-panel { display: none; }
-  ${tabsCss()}
+  ${tabsCss(maxTabs)}
   .tab-panel h1, .tab-panel h2, .tab-panel h3, .tab-panel h4, .tab-panel h5 { margin: 20px 0 8px; }
   .tab-panel p { line-height: 1.6; margin: 0 0 12px; }
   .tab-panel ul, .tab-panel ol { padding-left: 22px; line-height: 1.6; margin: 0 0 12px; }
@@ -1296,6 +1299,31 @@ async function runSelfCheck() {
   assert.strictEqual(colCheckboxCount, active.phases.length, "columns menu should list one checkbox per phase");
   assert.ok(html.includes('class="column" data-source="OpenSpec" data-phase="Proposal"'), "each column should be taggable by source+phase for the hide/show script");
   assert.ok(html.includes("spec-ui:hidden-phases:"), "columns-toggle script with its localStorage key should be embedded");
+
+  // A change with more files than any fixed tab-count constant would have
+  // allowed (regression test for a stale MAX_TABS=10 cap) must still get a
+  // working tab per file, not a click-does-nothing 11th+ tab.
+  const manyFilesDir = join(root, "many-files");
+  fs.mkdirSync(manyFilesDir, { recursive: true });
+  const manyFiles = Array.from({ length: 12 }, (_, i) => {
+    const p = join(manyFilesDir, `f${i}.md`);
+    fs.writeFileSync(p, `# File ${i}`);
+    return { label: `File ${i}`, path: p };
+  });
+  const manyFilesItem = {
+    source: "OpenSpec",
+    name: "many-files-change",
+    tasks: null,
+    phases: [{ label: "Proposal", done: true }],
+    files: manyFiles,
+    updated: new Date(),
+  };
+  const manyFilesHtml = render(root, [manyFilesItem]);
+  assert.ok(
+    manyFilesHtml.includes(":nth-of-type(12):checked ~ .tab-panels .tab-panel:nth-of-type(12)"),
+    "tab CSS should scale to cover every file, not stop at a fixed constant"
+  );
+  assert.ok(manyFilesHtml.includes("File 11"), "the last of 12 tabs should still be labeled and reachable");
 
   const baseItem = { name: "some-change", tasks: { total: 2, done: 1 }, phases: [], files: [], source: "OpenSpec" };
   const staleCard = renderCard({ ...baseItem, updated: new Date(Date.now() - (STALE_DAYS + 5) * 86400000) });
