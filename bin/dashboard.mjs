@@ -816,12 +816,33 @@ async function openTerminal(root) {
   return false;
 }
 
+// Best-effort native notification. Silent no-op on failure (e.g. no
+// notification daemon on a headless Linux box) — never blocks live-reload.
+function notify(title, body) {
+  if (process.platform === "darwin") {
+    return spawnDetached("osascript", ["-e", `display notification ${JSON.stringify(body)} with title ${JSON.stringify(title)}`]);
+  }
+  if (process.platform === "win32") {
+    const script = `Add-Type -AssemblyName System.Windows.Forms; $n = New-Object System.Windows.Forms.NotifyIcon; $n.Icon = [System.Drawing.SystemIcons]::Information; $n.Visible = $true; $n.ShowBalloonTip(5000, ${JSON.stringify(title)}, ${JSON.stringify(body)}, [System.Windows.Forms.ToolTipIcon]::Info); Start-Sleep -Seconds 6; $n.Dispose()`;
+    return spawnDetached("powershell", ["-NoProfile", "-Command", script]);
+  }
+  return spawnDetached("notify-send", [title, body]);
+}
+
 // ponytail: recursive fs.watch works on macOS/Windows out of the box; Linux needs
 // { recursive: true } support (Node 20+) or falls back to non-recursive watch — good
 // enough for a single-project PoC, revisit if this ships cross-platform.
-function startLiveServer(root, { port = 4949, open = true } = {}) {
+function scanPhaseSnapshot(root) {
+  const items = [...scanOpenSpec(root), ...scanSpecKit(root)];
+  const snapshot = new Map();
+  for (const item of items) snapshot.set(`${item.source}:${item.name}`, currentPhaseIndex(item));
+  return { items, snapshot };
+}
+
+function startLiveServer(root, { port = 4949, open = true, notifyOnChange = true } = {}) {
   const clients = new Set();
   let debounceTimer = null;
+  let lastSnapshot = notifyOnChange ? scanPhaseSnapshot(root).snapshot : null;
 
   function broadcastRefresh() {
     for (const res of clients) res.write("data: refresh\n\n");
@@ -829,7 +850,21 @@ function startLiveServer(root, { port = 4949, open = true } = {}) {
 
   function scheduleRefresh() {
     clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(broadcastRefresh, 150);
+    debounceTimer = setTimeout(() => {
+      if (notifyOnChange) {
+        const { items, snapshot } = scanPhaseSnapshot(root);
+        for (const item of items) {
+          const key = `${item.source}:${item.name}`;
+          const prevIdx = lastSnapshot.get(key);
+          const newIdx = snapshot.get(key);
+          if (prevIdx !== undefined && newIdx !== prevIdx) {
+            notify(`${item.name} moved phase`, `${item.phases[prevIdx].label} → ${item.phases[newIdx].label}`);
+          }
+        }
+        lastSnapshot = snapshot;
+      }
+      broadcastRefresh();
+    }, 150);
   }
 
   const watchDirs = [join(root, "openspec"), join(root, "specs")].filter(existsSync);
@@ -863,6 +898,13 @@ function startLiveServer(root, { port = 4949, open = true } = {}) {
   });
 
   server.on("close", () => watchers.forEach((w) => w.close()));
+  server.on("error", (err) => {
+    if (err.code === "EADDRINUSE") {
+      console.error(`Port ${port} is already in use — is another spec-ui --live already running? Try a different project or stop the other instance.`);
+      process.exit(1);
+    }
+    throw err;
+  });
   server.listen(port, () => {
     if (open) {
       const { port: actualPort } = server.address();
@@ -981,13 +1023,22 @@ async function runSelfCheck() {
 
   assert.ok(html.includes('id="card-search"'), "the card-name search input should be embedded");
 
+  // Underlying diff logic for the --live phase-change notification, without
+  // actually shelling out to notify() (no real OS popups during --test).
+  const beforePhase = scanPhaseSnapshot(root).snapshot.get("OpenSpec:add-login");
+  assert.strictEqual(beforePhase, 1, "add-login should start at its first incomplete phase (Design)");
+  writeFileSync(join(changeDir, "design.md"), "# design");
+  const afterPhase = scanPhaseSnapshot(root).snapshot.get("OpenSpec:add-login");
+  assert.strictEqual(afterPhase, 4, "adding design.md should advance add-login to Verify");
+  assert.notStrictEqual(beforePhase, afterPhase, "scanPhaseSnapshot should detect the phase change the --live notifier relies on");
+
   await testLiveReload(root);
 
   console.log("self-check passed");
 }
 
 async function testLiveReload(root) {
-  const server = startLiveServer(root, { port: 0, open: false });
+  const server = startLiveServer(root, { port: 0, open: false, notifyOnChange: false });
   await new Promise((resolve) => server.once("listening", resolve));
   const port = server.address().port;
 
@@ -1030,7 +1081,7 @@ async function main() {
   const root = resolve(args.find((a) => !a.startsWith("--")) || process.cwd());
 
   if (args.includes("--live")) {
-    startLiveServer(root, { open: !args.includes("--no-open") });
+    startLiveServer(root, { open: !args.includes("--no-open"), notifyOnChange: !args.includes("--no-notify") });
     return; // server.listen keeps the process alive
   }
 
